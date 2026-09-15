@@ -12,7 +12,7 @@
 [![Deployed on Render](https://img.shields.io/badge/Deployed-Render-46E3B7?logo=render&logoColor=white)](https://render.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**[Live Demo](https://earnings-sentinel.onrender.com)** · [How It Works](#how-it-works) · [Architecture](#architecture) · [Getting Started](#getting-started)
+[How It Works](#how-it-works) · [Architecture](#architecture) · [Getting Started](#getting-started)
 
 </div>
 
@@ -116,6 +116,8 @@ export ROIC_API_KEY=your_key
 export SEC_USER_AGENT="EarningsSentinel your_email@example.com"
 
 uvicorn app:app --reload
+
+**Run Python code in zip
 ```
 
 
