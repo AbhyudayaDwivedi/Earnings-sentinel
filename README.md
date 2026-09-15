@@ -117,7 +117,7 @@ export SEC_USER_AGENT="EarningsSentinel your_email@example.com"
 
 uvicorn app:app --reload
 ```
-Visit http://localhost:8000.
+
 
 ### Option 2: Deploy your own copy (Render)
 1. Fork this repo
