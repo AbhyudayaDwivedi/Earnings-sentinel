@@ -117,7 +117,7 @@ export SEC_USER_AGENT="EarningsSentinel your_email@example.com"
 
 uvicorn app:app --reload
 
-**Run Python code in zip
+**Run Python code @Colab_Code_For_Execution
 ```
 
 
