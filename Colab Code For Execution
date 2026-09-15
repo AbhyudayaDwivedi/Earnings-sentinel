@@ -1,3 +1,6 @@
+PS. Code execution requires ROIC and Gemini API. Refer README.md for execution info.
+
+
 # ==============================================================================
 # EARNINGS SENTINEL — Phase 1 + Phase 2 (Live Data Pipeline)
 # Give it a ticker. It fetches the latest earnings call, runs the analysis,
