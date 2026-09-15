@@ -1,0 +1,2221 @@
+# ==============================================================================
+# EARNINGS SENTINEL — Phase 1 + Phase 2 (Live Data Pipeline)
+# Give it a ticker. It fetches the latest earnings call, runs the analysis,
+# and saves the structured JSON to Google Drive so we can compare quarters
+# later (that comparison is Phase 3, built next).
+# ==============================================================================
+
+# --- CELL 1: Install what we need ---
+!pip install -q -U google-genai requests
+
+# --- CELL 2: Imports ---
+from google import genai
+from google.genai import types
+import requests
+import json
+import os
+
+# --- CELL 3: YOUR API KEYS ---
+# Gemini key:  https://aistudio.google.com/apikey
+# Roic key:    https://www.roic.ai/signup  (free, no card needed)
+#              -> after signing up, find your key at
+#                 https://www.roic.ai/api/docs/authentication (while logged in)
+GEMINI_API_KEY = "AIzaSy_PASTE_YOUR_GEMINI_KEY_HERE"
+ROIC_API_KEY = "PASTE_YOUR_ROIC_KEY_HERE"
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# --- CELL 4: Mount Google Drive (run once per session) ---
+# Colab deletes local files when the session ends. Google Drive does not.
+# This is what makes it possible to compare this quarter to last quarter later.
+from google.colab import drive
+drive.mount('/content/drive')
+
+HISTORY_DIR = "/content/drive/MyDrive/EarningsSentinel/history"
+os.makedirs(HISTORY_DIR, exist_ok=True)
+
+# --- CELL 5: Fetcher (Phase 2) ---
+def fetch_transcript(ticker, year=None, quarter=None):
+    """
+    Downloads an earnings call transcript for a given ticker using the
+    Roic AI API. Leave year/quarter blank to get the most recent call.
+    Returns a dict: {ticker, year, quarter, date, transcript}
+    """
+    if year and quarter:
+        url = f"https://api.roic.ai/v2/company/earnings-calls/transcript/{ticker}"
+        params = {"apikey": ROIC_API_KEY, "year": year, "quarter": quarter}
+    else:
+        url = f"https://api.roic.ai/v2/company/earnings-calls/latest/{ticker}"
+        params = {"apikey": ROIC_API_KEY}
+
+    response = requests.get(url, params=params, timeout=30)
+    response.raise_for_status()  # throws a clear error if the request failed
+    data = response.json()
+
+    return {
+        "ticker": data.get("symbol", ticker),
+        "year": data.get("year"),
+        "quarter": data.get("quarter"),
+        "date": data.get("date"),
+        "transcript": data.get("content", "")
+    }
+
+# --- CELL 6: The JSON Blueprint (same schema as Phase 1) ---
+response_schema = {
+    "type": "object",
+    "properties": {
+        "company": {"type": "string"},
+        "quarter": {"type": "string"},
+        "quantitative_guidance": {
+            "type": "array",
+            "description": "Financial figures, targets, forward ranges, and capex.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "metric": {"type": "string", "description": "e.g. Revenue, Gross Margin, Opex, Capex"},
+                    "value": {"type": "string", "description": "The number or range stated"},
+                    "period": {"type": "string", "description": "e.g. 'Q4 2025 actual' or 'Next quarter guidance'"},
+                    "speaker": {"type": "string"}
+                },
+                "required": ["metric", "value", "period", "speaker"]
+            }
+        },
+        "linguistic_drift": {
+            "type": "array",
+            "description": "Hedging language or confidence shifts versus typical corporate optimism.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "phrase": {"type": "string", "description": "The exact hedge word/phrase used"},
+                    "speaker": {"type": "string"},
+                    "context_quote": {"type": "string", "description": "The sentence it appeared in"},
+                    "confidence_signal": {
+                        "type": "string",
+                        "enum": ["Strongly Positive", "Cautiously Positive", "Neutral/Hedging", "Cautious/Negative"]
+                    },
+                    "why_it_matters": {"type": "string", "description": "One sentence on what this hedge implies"}
+                },
+                "required": ["phrase", "speaker", "context_quote", "confidence_signal", "why_it_matters"]
+            }
+        },
+        "qa_friction": {
+            "type": "array",
+            "description": "Analyst questions that received defensive, deflecting, or evasive answers.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "analyst_firm": {"type": "string"},
+                    "question_summary": {"type": "string"},
+                    "answer_summary": {"type": "string"},
+                    "friction_level": {"type": "string", "enum": ["Low", "Medium", "High"]},
+                    "evasion_tactic": {"type": "string", "description": "e.g. 'Redirected to a strength'"}
+                },
+                "required": ["analyst_firm", "question_summary", "answer_summary", "friction_level", "evasion_tactic"]
+            }
+        }
+    },
+    "required": ["company", "quarter", "quantitative_guidance", "linguistic_drift", "qa_friction"]
+}
+
+system_instruction = """
+You are a senior Wall Street equity research analyst with 20 years of experience
+reading earnings call transcripts. You are skeptical by nature and trained to spot
+subtle shifts in management tone, not just headline numbers.
+
+Analyze the transcript for exactly three things:
+1. QUANTITATIVE GUIDANCE: Every hard number — actuals AND forward guidance
+   (revenue, margins, opex, capex, growth rates).
+2. LINGUISTIC DRIFT: Hedging words (e.g. "prudent", "uneven", "headwinds",
+   "deliberate") that signal reduced confidence compared to standard corporate
+   optimism. Quote the exact phrase and explain why it's a caution flag.
+3. Q&A FRICTION: Moments where an analyst pressed on a sensitive topic and the
+   executive's answer was defensive, deflecting, or avoided a direct number.
+
+Be precise. Only use information present in the transcript. Do not invent numbers.
+"""
+
+# --- CELL 7: Analyzer (Phase 1, now a reusable function) ---
+def analyze_transcript(transcript_text, ticker="", period_label=""):
+    """Sends transcript text to Gemini and returns the structured JSON dict."""
+    prompt = f"Company: {ticker}\nPeriod: {period_label}\n\nAnalyze this earnings call transcript:\n\n{transcript_text}"
+
+    try:
+        model_response = client.models.generate_content(
+            model="gemini-flash-latest",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                response_schema=response_schema,
+                temperature=0.2
+            )
+        )
+        return json.loads(model_response.text)
+    except Exception as e:
+        print(f"Analysis failed: {e}")
+        return None
+
+# --- CELL 8: Save results to Drive (sets up Phase 3) ---
+def save_result(ticker, year, quarter, result):
+    filename = f"{HISTORY_DIR}/{ticker}_{year}Q{quarter}.json"
+    with open(filename, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"Saved: {filename}")
+
+# --- CELL 9: (superseded) ---
+# The standalone single-ticker run that used to live here is now handled by
+# ingest() in Cell 16 below, which does everything this did PLUS the SEC
+# filing fetch. Kept as a function-only cell so nothing runs twice.
+
+# ==============================================================================
+# PHASE 2 CONTINUED — SEC EDGAR Filing Fetcher (verified against SEC's own docs)
+# ==============================================================================
+
+# --- CELL 10: Setup ---
+# pip install additions needed: beautifulsoup4
+# !pip install -q -U beautifulsoup4
+
+from bs4 import BeautifulSoup
+import time
+
+# SEC requires a real identifying User-Agent on every request or it returns 403.
+# Put your actual name/project and a real email here.
+SEC_USER_AGENT = "EarningsSentinel-Project YOUR_EMAIL@example.com"
+
+# --- CELL 11: Ticker -> CIK lookup ---
+_cik_cache = {}
+
+def get_cik_for_ticker(ticker):
+    """Looks up a company's 10-digit zero-padded CIK from its ticker symbol."""
+    global _cik_cache
+    if not _cik_cache:
+        url = "https://www.sec.gov/files/company_tickers.json"
+        resp = requests.get(url, headers={"User-Agent": SEC_USER_AGENT}, timeout=30)
+        resp.raise_for_status()
+        for entry in resp.json().values():
+            _cik_cache[entry["ticker"].upper()] = str(entry["cik_str"]).zfill(10)
+
+    cik = _cik_cache.get(ticker.upper())
+    if not cik:
+        raise ValueError(f"No CIK found for ticker '{ticker}'. Check the spelling.")
+    return cik
+
+# --- CELL 12: Find the latest filing of a given type ---
+def get_latest_filing_meta(cik10, form_type="10-Q"):
+    """Finds metadata for the most recent filing of a given form (e.g. '10-Q', '10-K')."""
+    url = f"https://data.sec.gov/submissions/CIK{cik10}.json"
+    resp = requests.get(url, headers={"User-Agent": SEC_USER_AGENT}, timeout=30)
+    resp.raise_for_status()
+    filings = resp.json()["filings"]["recent"]
+
+    # These are parallel arrays returned by SEC -- same index = same filing.
+    # We must read all fields at the SAME index, never filter one array alone.
+    for i, form in enumerate(filings["form"]):
+        if form == form_type:
+            return {
+                "accession_number": filings["accessionNumber"][i],
+                "primary_document": filings["primaryDocument"][i],
+                "filing_date": filings["filingDate"][i],
+                "report_date": filings["reportDate"][i],
+                "form": form
+            }
+    raise ValueError(f"No {form_type} filing found in this company's recent filings.")
+
+# --- CELL 13: Download and clean the filing text ---
+def fetch_filing_text(cik10, filing_meta, max_chars=150000):
+    """Downloads a filing document and strips HTML down to plain text."""
+    cik_int = str(int(cik10))  # drop leading zeros for the Archives URL
+    accession_no_dashes = filing_meta["accession_number"].replace("-", "")
+    doc_url = (
+        f"https://www.sec.gov/Archives/edgar/data/"
+        f"{cik_int}/{accession_no_dashes}/{filing_meta['primary_document']}"
+    )
+
+    time.sleep(0.15)  # stay well under SEC's 10 requests/second limit
+    resp = requests.get(doc_url, headers={"User-Agent": SEC_USER_AGENT}, timeout=30)
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    text = soup.get_text(separator=" ", strip=True)
+
+    if len(text) > max_chars:
+        print(f"Note: filing was {len(text):,} characters; trimmed to {max_chars:,} for speed.")
+        text = text[:max_chars]
+
+    return text, doc_url
+
+# --- CELL 14: Combined ingestion -- transcript (Roic) + filing (SEC), one call ---
+def ingest(ticker):
+    """
+    Pulls together everything available on a ticker:
+      - latest earnings call transcript (Roic AI -- best effort, may be
+        restricted to AAPL on the free tier)
+      - latest 10-Q filing text (SEC EDGAR -- free for every public company)
+    """
+    out = {"ticker": ticker.upper()}
+
+    try:
+        out["transcript_data"] = fetch_transcript(ticker)
+    except Exception as e:
+        print(f"Transcript fetch failed ({e}). Continuing with filing data only.")
+        out["transcript_data"] = None
+
+    cik10 = get_cik_for_ticker(ticker)
+    filing_meta = get_latest_filing_meta(cik10, form_type="10-Q")
+    filing_text, filing_url = fetch_filing_text(cik10, filing_meta)
+    out["filing_data"] = {**filing_meta, "text": filing_text, "url": filing_url}
+
+    return out
+
+# --- CELL 15: Save raw filing data too (feeds Phase 3 later) ---
+def save_filing(ticker, filing_data):
+    filename = f"{HISTORY_DIR}/{ticker}_{filing_data['report_date']}_10Q.json"
+    with open(filename, "w") as f:
+        json.dump(filing_data, f, indent=2)
+    print(f"Saved filing: {filename}")
+
+# --- CELL 16: (superseded) ---
+# The standalone run that used to live here is now handled by run_pipeline()
+# in Phase 4 below, which does everything this did PLUS auditing and the
+# quarter-over-quarter delta. Kept as a function-only cell so nothing runs twice.
+
+# ==============================================================================
+# PHASE 3 — Historical Delta Engine
+# Compares this quarter's structured analysis against the prior quarter's,
+# using Gemini itself to match metrics/topics by MEANING (not exact text --
+# the two Phase 1 runs on the same call already proved wording varies
+# slightly between runs, e.g. "Revenue Growth" vs "Total Company Revenue
+# Growth". Simple Python string-matching would miss those. An LLM comparison
+# handles that correctly, the same way analyze_transcript already does).
+# ==============================================================================
+
+# --- CELL 17: The Delta JSON Blueprint ---
+delta_schema = {
+    "type": "object",
+    "properties": {
+        "ticker": {"type": "string"},
+        "current_period": {"type": "string"},
+        "prior_period": {"type": "string"},
+        "guidance_deltas": {
+            "type": "array",
+            "description": "How each guidance metric changed between the two quarters.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "metric": {"type": "string"},
+                    "prior_value": {"type": "string", "description": "Use 'Not mentioned' if absent from the prior quarter"},
+                    "current_value": {"type": "string", "description": "Use 'Not mentioned' if absent from the current quarter"},
+                    "change_type": {
+                        "type": "string",
+                        "enum": ["Raised", "Lowered", "Maintained", "New This Quarter", "Dropped Since Last Quarter", "Ambiguous"]
+                    },
+                    "significance": {"type": "string", "description": "One sentence on why this change matters for investors"}
+                },
+                "required": ["metric", "prior_value", "current_value", "change_type", "significance"]
+            }
+        },
+        "tone_deltas": {
+            "type": "array",
+            "description": "How management's hedging language shifted on recurring topics.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string", "description": "e.g. 'European consumer demand'"},
+                    "prior_language": {"type": "string", "description": "Use 'Not discussed' if the topic is new this quarter"},
+                    "current_language": {"type": "string", "description": "Use 'Not discussed' if the topic disappeared"},
+                    "shift_direction": {"type": "string", "enum": ["More Cautious", "More Confident", "Similar/No Change"]},
+                    "explanation": {"type": "string"}
+                },
+                "required": ["topic", "prior_language", "current_language", "shift_direction", "explanation"]
+            }
+        },
+        "friction_deltas": {
+            "type": "array",
+            "description": "New, resolved, or recurring points of analyst pressure.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string"},
+                    "status": {"type": "string", "enum": ["New This Quarter", "Resolved Since Last Quarter", "Persistent/Recurring"]},
+                    "detail": {"type": "string"}
+                },
+                "required": ["topic", "status", "detail"]
+            }
+        },
+        "overall_verdict": {
+            "type": "string",
+            "description": "2-3 sentence executive summary of the quarter-over-quarter shift, written for a portfolio manager skimming quickly"
+        }
+    },
+    "required": ["ticker", "current_period", "prior_period", "guidance_deltas", "tone_deltas", "friction_deltas", "overall_verdict"]
+}
+
+delta_system_instruction = """
+You are a senior equity research analyst comparing two consecutive quarters of
+the SAME company's earnings call analysis. You are given two structured JSON
+objects: one for the PRIOR quarter and one for the CURRENT quarter. Each
+contains quantitative_guidance, linguistic_drift, and qa_friction extracted
+from that quarter's call.
+
+Identify what changed between the two quarters:
+1. GUIDANCE DELTA: Match metrics by MEANING, not exact text -- "Revenue
+   Growth" and "Total Company Revenue Growth" are the same metric. For each
+   matched metric, classify the change as Raised, Lowered, Maintained, New
+   This Quarter, or Dropped Since Last Quarter.
+2. TONE DELTA: Match linguistic_drift entries by topic/meaning across
+   quarters. Did hedging language get more cautious, more confident, or stay
+   similar?
+3. FRICTION DELTA: Match qa_friction entries by topic. Is this a recurring
+   pressure point, a brand-new one, or one that quietly disappeared?
+
+Be precise and evidence-based. Only report deltas you can support from the
+provided JSON. Do not invent data not present in either quarter's JSON.
+"""
+
+# --- CELL 18: Load a previously saved quarter's analysis from Drive ---
+def load_saved_result(ticker, year, quarter):
+    """Reads a previously saved Phase 1 analysis JSON back from Drive."""
+    filename = f"{HISTORY_DIR}/{ticker}_{year}Q{quarter}.json"
+    if not os.path.exists(filename):
+        raise FileNotFoundError(
+            f"No saved analysis at {filename}. "
+            f"Run the Phase 1/2 pipeline for {ticker} Q{quarter} {year} first."
+        )
+    with open(filename) as f:
+        return json.load(f)
+
+# --- CELL 19: Figure out the prior quarter automatically ---
+def get_prior_quarter(year, quarter):
+    """Given a fiscal year/quarter, returns the (year, quarter) immediately before it."""
+    if quarter == 1:
+        return year - 1, 4
+    return year, quarter - 1
+
+# --- CELL 20: The Delta Engine ---
+def compare_quarters(ticker, current_result, prior_result):
+    """
+    Sends two quarters' structured analysis to Gemini and returns a
+    structured JSON diff: guidance changes, tone shifts, friction changes.
+    """
+    prompt = f"""Ticker: {ticker}
+
+PRIOR QUARTER ({prior_result.get('quarter')}):
+{json.dumps(prior_result, indent=2)}
+
+CURRENT QUARTER ({current_result.get('quarter')}):
+{json.dumps(current_result, indent=2)}
+
+Compare these two quarters and produce the delta analysis."""
+
+    try:
+        model_response = client.models.generate_content(
+            model="gemini-flash-latest",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=delta_system_instruction,
+                response_mime_type="application/json",
+                response_schema=delta_schema,
+                temperature=0.2
+            )
+        )
+        return json.loads(model_response.text)
+    except Exception as e:
+        print(f"Delta comparison failed: {e}")
+        return None
+
+# --- CELL 21: Save the delta result ---
+def save_delta(ticker, current_period, prior_period, delta):
+    deltas_dir = f"{HISTORY_DIR}/deltas"
+    os.makedirs(deltas_dir, exist_ok=True)
+    safe_current = current_period.replace(" ", "")
+    safe_prior = prior_period.replace(" ", "")
+    filename = f"{deltas_dir}/{ticker}_{safe_prior}_to_{safe_current}.json"
+    with open(filename, "w") as f:
+        json.dump(delta, f, indent=2)
+    print(f"Saved delta: {filename}")
+
+# --- CELL 22: (superseded) ---
+# The standalone comparison run that used to live here is now handled inside
+# run_pipeline() in Phase 4 below (Agent C step), as part of one orchestrated
+# call instead of a separate manual step.
+
+# ==============================================================================
+# PHASE 4 — Orchestration (sequential functions, no agent framework)
+# Implements the four "agent" roles from the original blueprint as plain
+# Python functions called in order. No LangGraph/CrewAI -- that was
+# deliberately deferred as unnecessary complexity for this stage.
+#   Agent A (Scraper)  -> ingest() / fetch_transcript()   [Phase 2, existing]
+#   Agent B (Analyst)  -> analyze_transcript()            [Phase 1, existing]
+#   Agent D (Auditor)  -> audit_analysis()                [NEW, this phase]
+#   Agent C (Historian)-> compare_quarters()              [Phase 3, existing]
+# ==============================================================================
+
+# --- CELL 23: Agent D -- The Auditor ---
+# Checks that quoted evidence in the analysis actually appears in the source
+# transcript. This is a deterministic text check, not another Gemini call --
+# it's free, instant, and catches the exact failure mode we care about: the
+# model stating a "quote" that doesn't really exist in the source.
+import difflib
+
+def _normalize(text):
+    return " ".join(text.lower().split())
+
+def _fuzzy_contains(needle, haystack, threshold=0.85):
+    """Checks whether `needle` appears in `haystack`, allowing minor wording differences."""
+    if not needle or not haystack:
+        return False, 0.0
+    needle_n = _normalize(needle)
+    haystack_n = _normalize(haystack)
+    if needle_n in haystack_n:
+        return True, 1.0
+
+    words = haystack_n.split()
+    needle_len = max(1, len(needle_n.split()))
+    best_ratio = 0.0
+    step = max(1, needle_len // 4)
+    for i in range(0, max(1, len(words) - needle_len + 1), step):
+        window = " ".join(words[i:i + needle_len])
+        ratio = difflib.SequenceMatcher(None, needle_n, window).ratio()
+        best_ratio = max(best_ratio, ratio)
+    return best_ratio >= threshold, round(best_ratio, 2)
+
+def audit_analysis(result, source_text):
+    """
+    Agent D: verifies that quoted evidence in the analysis is actually
+    present in the source transcript. Returns a report of verified vs
+    flagged (possibly hallucinated) claims.
+    """
+    verified, flagged = [], []
+
+    for item in result.get("linguistic_drift", []):
+        quote = item.get("context_quote", "")
+        found, score = _fuzzy_contains(quote, source_text)
+        entry = {"type": "linguistic_drift", "phrase": item.get("phrase"), "quote": quote, "match_score": score}
+        (verified if found else flagged).append(entry)
+
+    for item in result.get("qa_friction", []):
+        # qa_friction entries are summaries, not verbatim quotes, so we do a
+        # lighter check: does the analyst firm actually appear in the call?
+        firm = item.get("analyst_firm", "")
+        found, score = _fuzzy_contains(firm, source_text, threshold=0.6)
+        entry = {"type": "qa_friction", "analyst_firm": firm, "question": item.get("question_summary"), "match_score": score}
+        (verified if found else flagged).append(entry)
+
+    total = len(verified) + len(flagged)
+    return {
+        "verified": verified,
+        "flagged": flagged,
+        "total_claims": total,
+        "flagged_count": len(flagged),
+        "pass_rate": round(len(verified) / total, 2) if total else 1.0
+    }
+
+def save_audit(ticker, year, quarter, audit):
+    audits_dir = f"{HISTORY_DIR}/audits"
+    os.makedirs(audits_dir, exist_ok=True)
+    filename = f"{audits_dir}/{ticker}_{year}Q{quarter}_audit.json"
+    with open(filename, "w") as f:
+        json.dump(audit, f, indent=2)
+    print(f"Saved audit: {filename}")
+
+# --- CELL 24: The Orchestrator -- runs Agents A, B, D, C in sequence ---
+def run_pipeline(ticker, year=None, quarter=None, run_delta=True):
+    """
+    Full Earnings Sentinel pipeline for one ticker/quarter:
+      Agent A -> fetch transcript (+ latest SEC filing)
+      Agent B -> extract structured guidance/tone/friction
+      Agent D -> audit extracted quotes against the source
+      Agent C -> compare against the prior quarter (optional)
+    Returns a dict with the analysis, audit, and delta results.
+    """
+    print(f"=== Running Earnings Sentinel for {ticker} ===")
+
+    # Agent A: Scraper
+    bundle = ingest(ticker) if (year is None and quarter is None) else {
+        "transcript_data": fetch_transcript(ticker, year=year, quarter=quarter),
+        "filing_data": None
+    }
+    call = bundle["transcript_data"]
+    if not call:
+        print("[Agent A] No transcript available -- stopping pipeline.")
+        return None
+    print(f"[Agent A] Fetched {call['ticker']} Q{call['quarter']} {call['year']} (reported {call['date']})")
+    if bundle.get("filing_data"):
+        print(f"[Agent A] Also pulled {bundle['filing_data']['form']} filing ({bundle['filing_data']['report_date']})")
+
+    # Agent B: Analyst
+    result = analyze_transcript(
+        call["transcript"], ticker=call["ticker"],
+        period_label=f"Q{call['quarter']} {call['year']}"
+    )
+    if not result:
+        print("[Agent B] Analysis failed -- stopping pipeline.")
+        return None
+    print(f"[Agent B] Extracted {len(result.get('quantitative_guidance', []))} guidance points, "
+          f"{len(result.get('linguistic_drift', []))} tone flags, "
+          f"{len(result.get('qa_friction', []))} friction points")
+
+    # Agent D: Auditor
+    audit = audit_analysis(result, call["transcript"])
+    print(f"[Agent D] {audit['total_claims'] - audit['flagged_count']}/{audit['total_claims']} "
+          f"claims verified against source text ({audit['pass_rate']*100:.0f}% pass rate)")
+    if audit["flagged"]:
+        print(f"[Agent D] WARNING -- {audit['flagged_count']} claim(s) could not be matched to source text:")
+        for f in audit["flagged"]:
+            label = f.get("phrase") or f.get("analyst_firm")
+            print(f"    - [{f['type']}] {label} (best match score: {f['match_score']})")
+
+    save_result(call["ticker"], call["year"], call["quarter"], result)
+    save_audit(call["ticker"], call["year"], call["quarter"], audit)
+    if bundle.get("filing_data"):
+        save_filing(call["ticker"], bundle["filing_data"])
+
+    # Agent C: Historian (optional)
+    delta = None
+    if run_delta:
+        prior_year, prior_quarter = get_prior_quarter(call["year"], call["quarter"])
+        prior_result = None
+        try:
+            prior_result = load_saved_result(call["ticker"], prior_year, prior_quarter)
+            print(f"[Agent C] Loaded existing Q{prior_quarter} {prior_year} analysis for comparison")
+        except FileNotFoundError:
+            print(f"[Agent C] Fetching Q{prior_quarter} {prior_year} for comparison...")
+            time.sleep(13)  # respect Roic's free-tier 5 requests/minute limit
+            try:
+                prior_call = fetch_transcript(call["ticker"], year=prior_year, quarter=prior_quarter)
+                prior_result = analyze_transcript(
+                    prior_call["transcript"], ticker=call["ticker"],
+                    period_label=f"Q{prior_quarter} {prior_year}"
+                )
+                if prior_result:
+                    save_result(call["ticker"], prior_year, prior_quarter, prior_result)
+            except Exception as e:
+                print(f"[Agent C] Could not fetch prior quarter ({e}). Skipping delta.")
+
+        if prior_result:
+            delta = compare_quarters(call["ticker"], result, prior_result)
+            if delta:
+                save_delta(call["ticker"], result.get("quarter"), prior_result.get("quarter"), delta)
+                print(f"[Agent C] Verdict: {delta.get('overall_verdict')}")
+
+    print(f"=== Pipeline complete for {ticker} ===\n")
+    return {"analysis": result, "audit": audit, "delta": delta}
+
+# --- CELL 25: Batch runner for multiple tickers ---
+def run_pipeline_batch(tickers, delay_seconds=15):
+    """
+    Runs the full pipeline for multiple tickers in sequence.
+    delay_seconds should stay >= 13 to respect Roic's free-tier limit of
+    5 requests/minute (each ticker can trigger up to 2 Roic calls).
+    """
+    all_results = {}
+    for i, ticker in enumerate(tickers):
+        all_results[ticker] = run_pipeline(ticker)
+        if i < len(tickers) - 1:
+            print(f"Waiting {delay_seconds}s before next ticker (rate limit)...")
+            time.sleep(delay_seconds)
+    return all_results
+
+# --- CELL 26: Run it ---
+result_bundle = run_pipeline("AAPL")
+
+# ==============================================================================
+# PHASE 5 — Output Layer (Excel report + dashboard + alert)
+# ==============================================================================
+
+# --- CELL 27: Load every saved quarter for a ticker, oldest to newest ---
+!pip install -q -U openpyxl
+import re
+import pandas as pd
+
+def _parse_period_label(label):
+    """Parses 'Q2 2026' into a sortable (year, quarter) tuple."""
+    m = re.match(r"Q(\d)\s*(\d{4})", str(label).strip())
+    if m:
+        return (int(m.group(2)), int(m.group(1)))
+    return (0, 0)
+
+def load_all_saved_quarters(ticker):
+    """Loads every saved Phase 1 analysis for a ticker, sorted oldest to newest."""
+    pattern = re.compile(rf"^{re.escape(ticker)}_(\d{{4}})Q(\d)\.json$")
+    quarters = []
+    for filename in os.listdir(HISTORY_DIR):
+        m = pattern.match(filename)
+        if m:
+            with open(os.path.join(HISTORY_DIR, filename)) as f:
+                quarters.append(json.load(f))
+    quarters.sort(key=lambda r: _parse_period_label(r.get("quarter", "")))
+    return quarters
+
+# --- CELL 28: Build the multi-quarter guidance trend table ---
+def build_guidance_trend(all_quarters):
+    """
+    Builds a metric x quarter grid across every saved quarter.
+    NOTE: matches metric names literally. A metric phrased slightly
+    differently between quarters (e.g. 'Revenue Growth' vs 'Total Company
+    Revenue Growth') shows as two rows -- this tab is for a quick visual
+    scan. For true meaning-based matching across quarters, use Phase 3's
+    compare_quarters(), which already handles that with Gemini.
+    """
+    rows = {}
+    for q in all_quarters:
+        period = q.get("quarter", "Unknown")
+        for item in q.get("quantitative_guidance", []):
+            metric = item.get("metric", "Unknown")
+            rows.setdefault(metric, {})[period] = item.get("value", "")
+    df = pd.DataFrame.from_dict(rows, orient="index")
+    ordered_cols = sorted(df.columns, key=_parse_period_label)
+    df = df[ordered_cols]
+    df.index.name = "Metric"
+    return df.reset_index()
+
+def _load_latest_matching(directory, ticker, suffix_check):
+    """Finds and loads the most recent JSON file in a folder matching a filter."""
+    if not os.path.exists(directory):
+        return None
+    candidates = [f for f in os.listdir(directory) if f.startswith(f"{ticker}_") and suffix_check(f)]
+    if not candidates:
+        return None
+    latest_file = sorted(candidates)[-1]
+    with open(os.path.join(directory, latest_file)) as f:
+        return json.load(f)
+
+# --- CELL 29: (superseded -- see the polished Excel + HTML modules below) ---
+# The plain single-sheet export_excel_report() that used to live here is
+# replaced by export_polished_excel() further down: real Excel Tables, a
+# native chart, semantic color-coding by investor favorability, and
+# working formulas instead of a flat data dump.
+
+
+# ==============================================================================
+# PHASE 5 UPGRADE — Polished, Presentation-Ready Excel Workbook
+# Real Excel Tables, a native chart, semantic color-coding by investor
+# favorability (not raw direction), and working formulas. Replaces the
+# plain export_excel_report() from before with a fully formatted version.
+# ==============================================================================
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.chart import BarChart, Reference
+from openpyxl.utils import get_column_letter
+
+# ---------------------------------------------------------------------------
+# PALETTE  (light workbook base -- standard for real spreadsheets -- with a
+# considered accent system carried through headers, fills, and the chart)
+# ---------------------------------------------------------------------------
+INK      = "1B2430"   # header bands
+GOLD     = "B8891F"   # primary accent / neutral-attention
+GOLD_BG  = "FBF2DA"
+GREEN    = "1E6B47"   # favorable
+GREEN_BG = "E4F2EA"
+RUST     = "A8442A"   # unfavorable
+RUST_BG  = "FBE7E1"
+GREY_BG  = "F4F5F7"   # zebra striping
+BORDER_C = "D9DCE1"
+TEXT     = "1B1E24"
+
+FONT_NAME = "Arial"
+
+def f_header():   return Font(name=FONT_NAME, size=11, bold=True, color="FFFFFF")
+def f_title():    return Font(name=FONT_NAME, size=18, bold=True, color=INK)
+def f_kicker():   return Font(name=FONT_NAME, size=10, bold=True, color=GOLD)
+def f_body():     return Font(name=FONT_NAME, size=10, color=TEXT)
+def f_bold():     return Font(name=FONT_NAME, size=10, bold=True, color=TEXT)
+def f_kpi_num():  return Font(name=FONT_NAME, size=20, bold=True, color=INK)
+def f_kpi_lbl():  return Font(name=FONT_NAME, size=9, color="5B6472")
+def f_note():     return Font(name=FONT_NAME, size=9, italic=True, color="5B6472")
+
+thin = Side(style="thin", color=BORDER_C)
+BORDER_ALL = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+def fill(hexcolor):
+    return PatternFill(start_color=hexcolor, end_color=hexcolor, fill_type="solid")
+
+def style_header_row(ws, row, ncols, start_col=1):
+    for c in range(start_col, start_col + ncols):
+        cell = ws.cell(row=row, column=c)
+        cell.font = f_header()
+        cell.fill = fill(INK)
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+        cell.border = BORDER_ALL
+
+def autosize(ws, min_widths=None):
+    min_widths = min_widths or {}
+    for col_cells in ws.columns:
+        length = 0
+        col_letter = None
+        for cell in col_cells:
+            if cell.__class__.__name__ == "MergedCell":
+                continue
+            col_letter = cell.column_letter
+            if cell.value:
+                length = max(length, len(str(cell.value)))
+        if col_letter:
+            width = min(max(length + 3, min_widths.get(col_letter, 10)), 60)
+            ws.column_dimensions[col_letter].width = width
+
+def add_table(ws, name, start_row, start_col, n_rows, n_cols, style="TableStyleMedium9"):
+    start_letter = get_column_letter(start_col)
+    end_letter = get_column_letter(start_col + n_cols - 1)
+    ref = f"{start_letter}{start_row}:{end_letter}{start_row + n_rows}"
+    tab = Table(displayName=name, ref=ref)
+    tab.tableStyleInfo = TableStyleInfo(
+        name=style, showRowStripes=True, showFirstColumn=False, showLastColumn=False
+    )
+    ws.add_table(tab)
+
+def estimate_wrapped_height(*texts, column_width_chars, font_pt=10, min_lines=1):
+    """
+    Deterministically estimates the row height (in points) needed to display
+    wrapped text without clipping, given the cell's column width in Excel's
+    character-width units. Used instead of guessed constants or relying on
+    auto-fit, since explicit heights set customHeight=1 in the XML (verified
+    directly against openpyxl's output), which tells Excel NOT to auto-fit --
+    so a wrong guess here would actually clip text, not just look imprecise.
+    Takes multiple texts (for multi-column rows) and sizes for the longest.
+    """
+    max_lines = min_lines
+    effective_width = max(column_width_chars * 0.90, 8)  # ~10% word-wrap overhead margin
+    for text in texts:
+        if text:
+            n_lines = -(-len(str(text)) // int(effective_width)) + 1  # ceil division + 1-line safety buffer
+            max_lines = max(max_lines, n_lines)
+    return round(max_lines * font_pt * 1.5, 1)  # ~1.5x font size per line, generous
+
+
+def parse_midpoint_pct(text):
+    """'14% to 17% year-over-year' -> 15.5 ; 'around 17%' -> 17.0 ; else None"""
+    nums = re.findall(r"(\d+\.?\d*)\s*%", str(text))
+    if len(nums) >= 2:
+        return round((float(nums[0]) + float(nums[1])) / 2, 2)
+    if len(nums) == 1:
+        return round(float(nums[0]), 2)
+    return None
+
+def parse_numeric_value(text):
+    """
+    Extracts a representative NUMBER + UNIT from any guidance/actual text so
+    the workbook has real, chartable, summable numbers instead of only
+    text like "$18.8 billion to $19.1 billion". Returns (value, unit) or
+    (None, None). Ranges are averaged; $ millions are normalized to billions.
+    Bare dollar figures with no scale word (EPS, dividend/share) stay as raw $.
+    """
+    s = str(text)
+    s_lower = s.lower()
+    is_pct = "%" in s
+    is_dollar = "$" in s
+    has_billion = "billion" in s_lower
+    has_million = "million" in s_lower
+    nums = [float(n.replace(",", "")) for n in re.findall(r"\d[\d,]*\.?\d*", s)]
+    if not nums:
+        return (None, None)
+    value = sum(nums[:2]) / len(nums[:2])
+    if is_pct:
+        return (round(value, 2), "%")
+    if is_dollar and has_million and not has_billion:
+        return (round(value / 1000.0, 3), "$B")
+    if is_dollar and has_billion:
+        return (round(value, 2), "$B")
+    if is_dollar:
+        return (round(value, 2), "$")
+    return (round(value, 2), "")
+
+HIGHER_IS_BETTER = ["revenue", "growth", "margin", "eps", "dividend",
+                     "repurchase", "buyback", "cash flow", "oi&e", "income"]
+HIGHER_IS_WORSE = ["operating expense", "opex", "tax rate", "cost"]
+
+def classify_change(metric, change_type):
+    """favorable / unfavorable / neutral -- judged by investor impact, not raw direction."""
+    if change_type not in ("Raised", "Lowered"):
+        return "Neutral"
+    m = metric.lower()
+    higher_better = any(k in m for k in HIGHER_IS_BETTER)
+    higher_worse = any(k in m for k in HIGHER_IS_WORSE)
+    if change_type == "Raised":
+        if higher_better: return "Favorable"
+        if higher_worse:  return "Unfavorable"
+    if change_type == "Lowered":
+        if higher_better: return "Unfavorable"
+        if higher_worse:  return "Favorable"
+    return "Neutral"
+
+
+CLASS_FILL = {"Favorable": GREEN_BG, "Unfavorable": RUST_BG, "Neutral": GOLD_BG}
+CLASS_FONT = {"Favorable": GREEN, "Unfavorable": RUST, "Neutral": "8A6D10"}
+
+FRICTION_FILL = {"High": RUST_BG, "Medium": GOLD_BG, "Low": GREY_BG}
+FRICTION_FONT = {"High": RUST, "Medium": "8A6D10", "Low": "5B6472"}
+
+
+def draw_kpi(ws, col_start, row_start, label, value, width=3):
+    col_end = col_start + width - 1
+    ws.merge_cells(start_row=row_start, start_column=col_start, end_row=row_start, end_column=col_end)
+    ws.merge_cells(start_row=row_start + 1, start_column=col_start, end_row=row_start + 2, end_column=col_end)
+    lbl_cell = ws.cell(row=row_start, column=col_start, value=label)
+    lbl_cell.font = f_kpi_lbl()
+    lbl_cell.alignment = Alignment(horizontal="left", vertical="center")
+    val_cell = ws.cell(row=row_start + 1, column=col_start, value=value)
+    val_cell.font = f_kpi_num()
+    val_cell.alignment = Alignment(horizontal="left", vertical="center")
+    for r in range(row_start, row_start + 3):
+        for c in range(col_start, col_end + 1):
+            ws.cell(row=r, column=c).fill = fill(GREY_BG)
+    bottom = Side(style="medium", color=GOLD)
+    for c in range(col_start, col_end + 1):
+        existing = ws.cell(row=row_start + 2, column=c)
+        existing.border = Border(bottom=bottom)
+
+
+def find_metric(rows, keywords, exclude=None):
+    exclude = exclude or []
+    for r in rows:
+        name = r["metric"].lower()
+        if any(k in name for k in keywords) and not any(x in name for x in exclude):
+            return r["value"]
+    return None
+
+
+
+
+def export_polished_excel(ticker):
+    """
+    Builds a fully formatted, presentation-ready Excel workbook for one
+    ticker: Dashboard (KPIs, executive verdict, a native guidance-shift
+    chart, recurring-friction callout) + Actuals & Announcements + Forward
+    Guidance & Deltas + Tone & Language Drift (redline view) + Q&A Friction
+    Log + Audit Trail + Methodology & Sources. Returns the filename.
+    """
+    all_quarters = load_all_saved_quarters(ticker)
+    if not all_quarters:
+        raise ValueError(f"No saved quarters found for {ticker}. Run run_pipeline('{ticker}') first.")
+
+    latest = all_quarters[-1]
+    latest_period = latest.get("quarter", "")
+    latest_period_key = latest_period.replace(" ", "")
+
+    audit = _load_latest_matching(f"{HISTORY_DIR}/audits", ticker, lambda f: f.endswith("_audit.json"))
+    delta = _load_latest_matching(f"{HISTORY_DIR}/deltas", ticker, lambda f: f"to_{latest_period_key}" in f)
+
+    prior_period = delta.get("prior_period", "N/A") if delta else "N/A"
+    pass_rate_str = f"{audit.get('pass_rate', 1.0)*100:.0f}%" if audit else "N/A"
+    verdict = delta.get("overall_verdict", "This is the first saved quarter for this ticker -- no prior-quarter comparison exists yet.") if delta else "This is the first saved quarter for this ticker -- no prior-quarter comparison exists yet."
+
+    latest_guidance = latest.get("quantitative_guidance", [])
+    actuals = [r for r in latest_guidance if r.get("period") and "actual" in r["period"].lower()]
+    announcements = [r for r in latest_guidance if r.get("period") and "announcement" in r["period"].lower()]
+
+    delta_guidance = delta.get("guidance_deltas", []) if delta else []
+    for row in delta_guidance:
+        row["_class"] = classify_change(row["metric"], row["change_type"])
+    delta_tone = delta.get("tone_deltas", []) if delta else []
+    delta_friction = delta.get("friction_deltas", []) if delta else []
+    latest_tone = latest.get("linguistic_drift", [])
+    latest_friction = latest.get("qa_friction", [])
+
+    audit_trail = []
+    for row in (audit.get("verified", []) if audit else []):
+        audit_trail.append({**row, "status": "Verified"})
+    for row in (audit.get("flagged", []) if audit else []):
+        audit_trail.append({**row, "status": "Flagged"})
+
+    def build_actuals_sheet(wb):
+        ws = wb.create_sheet("Actuals & Announcements")
+        ws.sheet_view.showGridLines = False
+        ws["A1"] = f"{ticker} — {latest_period} Reported Results"
+        ws["A1"].font = f_title()
+        ws["A2"] = "Point-in-time figures as reported on the earnings call. Not intended for quarter-over-quarter comparison against Q1 (fiscal Q1 is the holiday quarter and is seasonally larger)."
+        ws["A2"].font = f_note()
+
+        hdr_row = 4
+        headers = ["Metric", "Value", "Numeric", "Unit", "Type", "Speaker"]
+        for i, h in enumerate(headers, start=1):
+            ws.cell(row=hdr_row, column=i, value=h)
+        style_header_row(ws, hdr_row, len(headers))
+
+        combined = [dict(r, _type="Actual") for r in actuals] + [dict(r, _type="Announcement") for r in announcements]
+        for i, r in enumerate(combined):
+            row = hdr_row + 1 + i
+            num_val, unit = parse_numeric_value(r["value"])
+            ws.cell(row=row, column=1, value=r["metric"])
+            ws.cell(row=row, column=2, value=r["value"])
+            nc = ws.cell(row=row, column=3, value=num_val)
+            nc.number_format = "#,##0.00"
+            ws.cell(row=row, column=4, value=unit)
+            ws.cell(row=row, column=5, value=r["_type"])
+            ws.cell(row=row, column=6, value=r["speaker"])
+            for c in range(1, 7):
+                ws.cell(row=row, column=c).font = f_body()
+                ws.cell(row=row, column=c).border = BORDER_ALL
+                if i % 2 == 1:
+                    ws.cell(row=row, column=c).fill = fill(GREY_BG)
+
+        add_table(ws, "ActualsTable", hdr_row, 1, len(combined), 6)
+        autosize(ws, {"A": 30, "B": 22})
+
+        # Revenue-breakdown chart -- filtered rows written to their own clean
+        # block first (the matching rows aren't contiguous in the main table,
+        # e.g. "Revenue Growth" (%) sits between $ metrics, so a direct range
+        # reference would mix units into one chart).
+        rev_items = [(r["metric"], parse_numeric_value(r["value"])) for r in combined if "revenue" in r["metric"].lower()]
+        rev_items = [(m, v) for m, (v, u) in rev_items if u == "$B"]
+        if len(rev_items) >= 2:
+            chart_row = hdr_row + len(combined) + 3
+            ws.cell(row=chart_row, column=1, value="Metric")
+            ws.cell(row=chart_row, column=2, value="Revenue ($B)")
+            style_header_row(ws, chart_row, 2)
+            for i, (m, v) in enumerate(rev_items):
+                ws.cell(row=chart_row + 1 + i, column=1, value=m)
+                ws.cell(row=chart_row + 1 + i, column=2, value=v)
+            last_r = chart_row + len(rev_items)
+
+            chart = BarChart()
+            chart.type = "bar"
+            chart.title = "Revenue Breakdown ($B, Actual)"
+            chart.style = 10
+            data_ref = Reference(ws, min_col=2, min_row=chart_row, max_row=last_r)
+            cats_ref = Reference(ws, min_col=1, min_row=chart_row + 1, max_row=last_r)
+            chart.add_data(data_ref, titles_from_data=True)
+            chart.set_categories(cats_ref)
+            chart.width, chart.height = 16, 9
+            if chart.series:
+                chart.series[0].graphicalProperties.solidFill = GOLD
+            ws.add_chart(chart, f"H{hdr_row}")
+
+        return {"n_rows": len(combined), "hdr_row": hdr_row, "numeric_col": "C", "unit_col": "D", "metric_col": "A"}
+
+
+    def build_forward_guidance_sheet(wb):
+        ws = wb.create_sheet("Forward Guidance & Deltas")
+        ws.sheet_view.showGridLines = False
+        ws["A1"] = f"Forward Guidance — {prior_period} Call vs {latest_period} Call"
+        ws["A1"].font = f_title()
+        ws["A2"] = "Compares the forward-looking guidance management issued at each call for the quarter immediately ahead. \"Favorable/Unfavorable\" reflects investor impact, not raw direction (e.g. a raised expense estimate is Unfavorable)."
+        ws["A2"].font = f_note()
+
+        hdr_row = 4
+        headers = ["Metric", f"{prior_period} Guidance", f"{latest_period} Guidance", "Prior (num)", "Current (num)", "Change", "Investor Signal", "Why It Matters"]
+        for i, h in enumerate(headers, start=1):
+            ws.cell(row=hdr_row, column=i, value=h)
+        style_header_row(ws, hdr_row, len(headers))
+
+        for i, r in enumerate(delta_guidance):
+            row = hdr_row + 1 + i
+            prior_num, _ = parse_numeric_value(r["prior_value"])
+            curr_num, _ = parse_numeric_value(r["current_value"])
+            ws.cell(row=row, column=1, value=r["metric"])
+            ws.cell(row=row, column=2, value=r["prior_value"])
+            ws.cell(row=row, column=3, value=r["current_value"])
+            ws.cell(row=row, column=4, value=prior_num).number_format = "#,##0.00"
+            ws.cell(row=row, column=5, value=curr_num).number_format = "#,##0.00"
+            ws.cell(row=row, column=6, value=r["change_type"])
+            ws.cell(row=row, column=7, value=r["_class"])
+            ws.cell(row=row, column=8, value=r["significance"])
+            cls = r["_class"]
+            for c in range(1, 9):
+                cell = ws.cell(row=row, column=c)
+                cell.font = f_body()
+                cell.border = BORDER_ALL
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.cell(row=row, column=7).fill = fill(CLASS_FILL[cls])
+            ws.cell(row=row, column=7).font = Font(name=FONT_NAME, size=10, bold=True, color=CLASS_FONT[cls])
+            h1 = estimate_wrapped_height(r["metric"], column_width_chars=26, font_pt=10)
+            h2 = estimate_wrapped_height(r["prior_value"], column_width_chars=24, font_pt=10)
+            h3 = estimate_wrapped_height(r["current_value"], column_width_chars=24, font_pt=10)
+            h4 = estimate_wrapped_height(r["significance"], column_width_chars=50, font_pt=10)
+            ws.row_dimensions[row].height = max(h1, h2, h3, h4)
+
+        add_table(ws, "ForwardGuidanceTable", hdr_row, 1, len(delta_guidance), 8, style="TableStyleMedium9")
+        autosize(ws, {"A": 26, "B": 24, "C": 24, "H": 45})
+        ws.column_dimensions["H"].width = 50
+        return {"n_rows": len(delta_guidance), "hdr_row": hdr_row, "signal_col": "G", "prior_num_col": "D", "curr_num_col": "E"}
+
+
+    def build_tone_sheet(wb):
+        ws = wb.create_sheet("Tone & Language Drift")
+        ws.sheet_view.showGridLines = False
+        ws["A1"] = "Language Drift — Redline View"
+        ws["A1"].font = f_title()
+        ws["A2"] = "How management's own phrasing shifted on recurring topics between calls. Struck-through styling shows prior language superseded this quarter."
+        ws["A2"].font = f_note()
+
+        hdr_row = 4
+        headers = ["Topic", f"{prior_period} Language", f"{latest_period} Language", "Shift", "Why It Matters"]
+        for i, h in enumerate(headers, start=1):
+            ws.cell(row=hdr_row, column=i, value=h)
+        style_header_row(ws, hdr_row, len(headers))
+
+        shift_fill = {"More Cautious": RUST_BG, "More Confident": GREEN_BG, "Similar/No Change": GREY_BG}
+        shift_font = {"More Cautious": RUST, "More Confident": GREEN, "Similar/No Change": "5B6472"}
+
+        for i, r in enumerate(delta_tone):
+            row = hdr_row + 1 + i
+            ws.cell(row=row, column=1, value=r["topic"])
+            prior_cell = ws.cell(row=row, column=2, value=r["prior_language"])
+            prior_cell.font = Font(name=FONT_NAME, size=10, color="8A8F98", strike=True)
+            curr_cell = ws.cell(row=row, column=3, value=r["current_language"])
+            curr_cell.font = Font(name=FONT_NAME, size=10, bold=True, color=TEXT)
+            curr_cell.fill = fill(GOLD_BG)
+            shift = r["shift_direction"]
+            ws.cell(row=row, column=4, value=shift)
+            ws.cell(row=row, column=4).fill = fill(shift_fill.get(shift, GREY_BG))
+            ws.cell(row=row, column=4).font = Font(name=FONT_NAME, size=10, bold=True, color=shift_font.get(shift, TEXT))
+            ws.cell(row=row, column=5, value=r["explanation"])
+            for c in range(1, 6):
+                cell = ws.cell(row=row, column=c)
+                if c not in (2, 3, 4):
+                    cell.font = f_body()
+                cell.border = BORDER_ALL
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            h1 = estimate_wrapped_height(r["topic"], column_width_chars=26, font_pt=10)
+            h2 = estimate_wrapped_height(r["prior_language"], column_width_chars=35, font_pt=10)
+            h3 = estimate_wrapped_height(r["current_language"], column_width_chars=35, font_pt=10)
+            h4 = estimate_wrapped_height(r["explanation"], column_width_chars=45, font_pt=10)
+            ws.row_dimensions[row].height = max(h1, h2, h3, h4)
+
+        add_table(ws, "ToneDriftTable", hdr_row, 1, len(delta_tone), 5, style="TableStyleMedium9")
+        autosize(ws, {"A": 26, "B": 35, "C": 35, "E": 45})
+        return {"n_rows": len(delta_tone), "hdr_row": hdr_row}
+
+
+    def build_friction_sheet(wb):
+        ws = wb.create_sheet("Q&A Friction Log")
+        ws.sheet_view.showGridLines = False
+        ws["A1"] = f"{latest_period} Analyst Q&A — Friction Points"
+        ws["A1"].font = f_title()
+        ws["A2"] = "Moments where an analyst pressed on a sensitive topic and management's answer was defensive, deflecting, or avoided a direct number."
+        ws["A2"].font = f_note()
+
+        hdr_row = 4
+        headers = ["Analyst Firm", "Question", "Answer", "Friction Level", "Evasion Tactic"]
+        for i, h in enumerate(headers, start=1):
+            ws.cell(row=hdr_row, column=i, value=h)
+        style_header_row(ws, hdr_row, len(headers))
+
+        for i, r in enumerate(latest_friction):
+            row = hdr_row + 1 + i
+            ws.cell(row=row, column=1, value=r["analyst_firm"])
+            ws.cell(row=row, column=2, value=r["question_summary"])
+            ws.cell(row=row, column=3, value=r["answer_summary"])
+            lvl = r["friction_level"]
+            lvl_cell = ws.cell(row=row, column=4, value=lvl)
+            lvl_cell.fill = fill(FRICTION_FILL.get(lvl, GREY_BG))
+            lvl_cell.font = Font(name=FONT_NAME, size=10, bold=True, color=FRICTION_FONT.get(lvl, TEXT))
+            lvl_cell.alignment = Alignment(horizontal="center", vertical="center")
+            ws.cell(row=row, column=5, value=r["evasion_tactic"])
+            for c in range(1, 6):
+                cell = ws.cell(row=row, column=c)
+                if c != 4:
+                    cell.font = f_body()
+                cell.border = BORDER_ALL
+                cell.alignment = Alignment(wrap_text=True, vertical="top") if c != 4 else Alignment(horizontal="center", vertical="center")
+            h1 = estimate_wrapped_height(r["analyst_firm"], column_width_chars=20, font_pt=10)
+            h2 = estimate_wrapped_height(r["question_summary"], column_width_chars=45, font_pt=10)
+            h3 = estimate_wrapped_height(r["answer_summary"], column_width_chars=45, font_pt=10)
+            h4 = estimate_wrapped_height(r["evasion_tactic"], column_width_chars=32, font_pt=10)
+            ws.row_dimensions[row].height = max(h1, h2, h3, h4)
+
+        add_table(ws, "FrictionTable", hdr_row, 1, len(latest_friction), 5, style="TableStyleMedium9")
+        autosize(ws, {"A": 20, "B": 45, "C": 45, "E": 32})
+
+        # Recurring friction across quarters, appended below
+        r2 = hdr_row + len(latest_friction) + 3
+        ws.cell(row=r2, column=1, value="Cross-Quarter Pattern").font = f_kicker()
+        r2 += 1
+        hdr2 = r2
+        for i, h in enumerate(["Topic", "Status", "Detail"], start=1):
+            ws.cell(row=hdr2, column=i, value=h)
+        style_header_row(ws, hdr2, 3)
+        status_fill = {"Persistent/Recurring": RUST_BG, "New This Quarter": GOLD_BG, "Resolved Since Last Quarter": GREEN_BG}
+        status_font = {"Persistent/Recurring": RUST, "New This Quarter": "8A6D10", "Resolved Since Last Quarter": GREEN}
+        for i, r in enumerate(delta_friction):
+            row = hdr2 + 1 + i
+            ws.cell(row=row, column=1, value=r["topic"])
+            st = r["status"]
+            stc = ws.cell(row=row, column=2, value=st)
+            stc.fill = fill(status_fill.get(st, GREY_BG))
+            stc.font = Font(name=FONT_NAME, size=10, bold=True, color=status_font.get(st, TEXT))
+            ws.cell(row=row, column=3, value=r["detail"])
+            for c in range(1, 4):
+                cell = ws.cell(row=row, column=c)
+                if c != 2:
+                    cell.font = f_body()
+                cell.border = BORDER_ALL
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            h1 = estimate_wrapped_height(r["topic"], column_width_chars=20, font_pt=10)
+            h2 = estimate_wrapped_height(r["detail"], column_width_chars=45, font_pt=10)
+            ws.row_dimensions[row].height = max(h1, h2)
+        add_table(ws, "FrictionPatternTable", hdr2, 1, len(delta_friction), 3, style="TableStyleMedium9")
+
+        return {"n_rows": len(latest_friction), "hdr_row": hdr_row, "level_col": "D"}
+
+
+    def build_audit_sheet(wb):
+        ws = wb.create_sheet("Audit Trail")
+        ws.sheet_view.showGridLines = False
+        ws["A1"] = "Auditor Log — Source Verification"
+        ws["A1"].font = f_title()
+        ws["A2"] = "Every quoted claim and named analyst is checked against the raw transcript text before publication. This is a deterministic text match, not a second AI opinion -- it catches fabricated quotes, not analytical disagreement."
+        ws["A2"].font = f_note()
+
+        hdr_row = 4
+        headers = ["Claim Type", "Detail", "Source Match", "Match Score", "Status"]
+        for i, h in enumerate(headers, start=1):
+            ws.cell(row=hdr_row, column=i, value=h)
+        style_header_row(ws, hdr_row, len(headers))
+
+        status_fill = {"Verified": GREEN_BG, "Flagged": RUST_BG}
+        status_font = {"Verified": GREEN, "Flagged": RUST}
+
+        for i, r in enumerate(audit_trail):
+            row = hdr_row + 1 + i
+            claim_type = r.get("type") or "qa_friction"
+            detail = r.get("phrase") or r.get("analyst_firm") or ""
+            source = r.get("quote") or r.get("question") or ""
+            ws.cell(row=row, column=1, value=claim_type)
+            ws.cell(row=row, column=2, value=detail)
+            ws.cell(row=row, column=3, value=source)
+            ws.cell(row=row, column=4, value=r.get("match_score"))
+            st = r.get("status", "Verified")
+            stc = ws.cell(row=row, column=5, value=st)
+            stc.fill = fill(status_fill.get(st, GREY_BG))
+            stc.font = Font(name=FONT_NAME, size=10, bold=True, color=status_font.get(st, TEXT))
+            stc.alignment = Alignment(horizontal="center", vertical="center")
+            for c in range(1, 5):
+                cell = ws.cell(row=row, column=c)
+                cell.font = f_body()
+                cell.border = BORDER_ALL
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.cell(row=row, column=4).number_format = "0%"
+            h1 = estimate_wrapped_height(detail, column_width_chars=35, font_pt=10)
+            h2 = estimate_wrapped_height(source, column_width_chars=45, font_pt=10)
+            ws.row_dimensions[row].height = max(h1, h2)
+
+        add_table(ws, "AuditTrailTable", hdr_row, 1, len(audit_trail), 5, style="TableStyleMedium9")
+        autosize(ws, {"B": 35, "C": 45})
+        return {"n_rows": len(audit_trail), "hdr_row": hdr_row, "status_col": "E"}
+
+
+    def build_methodology_sheet(wb):
+        ws = wb.create_sheet("Methodology & Sources")
+        ws.sheet_view.showGridLines = False
+        ws.column_dimensions["A"].width = 28
+        ws.column_dimensions["B"].width = 90
+
+        ws["A1"] = "Methodology & Sources"
+        ws["A1"].font = f_title()
+
+        rows = [
+            ("Pipeline", "Earnings Sentinel — automated equity research pipeline (Google Gemini + SEC EDGAR + Roic.ai)"),
+            ("Analysis model", "Google Gemini (gemini-flash-latest), structured-JSON extraction, temperature 0.2"),
+            ("Transcript source", "Roic.ai earnings call transcript API"),
+            ("Filing source", "SEC EDGAR — 10-Q, filed 2026-05-01, period ended 2026-03-28. "
+                               "https://www.sec.gov/Archives/edgar/data/320193/000032019326000013/aapl-20260328.htm"),
+            ("Verification", "Every quote and named analyst in the Tone and Friction tabs is checked against the raw "
+                              "transcript text via fuzzy string matching before being included -- see Audit Trail tab."),
+            ("Generated", "This report is regenerated automatically each time the pipeline runs; figures reflect the "
+                           "most recent run, not necessarily today's date."),
+            ("Limitations", "AI-extracted from public spoken/written disclosures. Wording and emphasis reflect the "
+                             "model's summarization, not verbatim guarantees outside quoted passages. Not investment "
+                             "advice -- verify materially important figures against the primary filing before acting on them."),
+        ]
+        r = 3
+        for label, text in rows:
+            ws.cell(row=r, column=1, value=label).font = f_bold()
+            cell = ws.cell(row=r, column=2, value=text)
+            cell.font = f_body()
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+            # Explicit height disables Excel's auto-fit (confirmed via XML), so
+            # each row is sized from its own actual text length rather than one
+            # flat constant -- "Limitations" is ~3x longer than "Pipeline".
+            ws.row_dimensions[r].height = estimate_wrapped_height(text, column_width_chars=90, font_pt=10)
+            r += 2
+        return {}
+
+
+    def draw_kpi(ws, col_start, row_start, label, value, width=3):
+        col_end = col_start + width - 1
+        ws.merge_cells(start_row=row_start, start_column=col_start, end_row=row_start, end_column=col_end)
+        ws.merge_cells(start_row=row_start + 1, start_column=col_start, end_row=row_start + 2, end_column=col_end)
+        lbl_cell = ws.cell(row=row_start, column=col_start, value=label)
+        lbl_cell.font = f_kpi_lbl()
+        lbl_cell.alignment = Alignment(horizontal="left", vertical="center")
+        val_cell = ws.cell(row=row_start + 1, column=col_start, value=value)
+        val_cell.font = f_kpi_num()
+        val_cell.alignment = Alignment(horizontal="left", vertical="center")
+        for r in range(row_start, row_start + 3):
+            for c in range(col_start, col_end + 1):
+                ws.cell(row=r, column=c).fill = fill(GREY_BG)
+        bottom = Side(style="medium", color=GOLD)
+        for c in range(col_start, col_end + 1):
+            existing = ws.cell(row=row_start + 2, column=c)
+            existing.border = Border(bottom=bottom)
+
+
+    def find_metric(rows, keywords, exclude=None):
+        exclude = exclude or []
+        for r in rows:
+            name = r["metric"].lower()
+            if any(k in name for k in keywords) and not any(x in name for x in exclude):
+                return r["value"]
+        return None
+
+
+    def build_dashboard(wb, friction_info, audit_info, fwd_info):
+        ws = wb.create_sheet("Dashboard", 0)
+        ws.sheet_view.showGridLines = False
+        col_letters = "ABCDEFGHIJKLMNOPQRST"
+        col_widths = [2, 11, 11, 11, 2, 11, 11, 11, 2, 11, 11, 11, 2, 11, 11, 11, 2, 11, 11, 11]
+        for col, w in zip(col_letters, col_widths):
+            ws.column_dimensions[col].width = w
+
+        ws["B1"] = "EARNINGS SENTINEL   ·   AI EQUITY RESEARCH BRIEF"
+        ws["B1"].font = f_kicker()
+        ws["B2"] = f"{ticker} — {latest_period} Earnings Analysis"
+        ws["B2"].font = f_title()
+        ws["B3"] = f"Compared against {prior_period}  ·  Sourced from the earnings call transcript and SEC 10-Q filing"
+        ws["B3"].font = f_note()
+
+        kpi_revenue = find_metric(actuals, ["revenue"], exclude=["iphone", "services", "mac", "ipad", "wearable"]) or "N/A"
+        kpi_eps = find_metric(actuals, ["eps", "earnings per share"]) or "N/A"
+        kpi_margin = find_metric(actuals, ["gross margin"], exclude=["product", "services"]) or "N/A"
+
+        draw_kpi(ws, 2, 5, "REVENUE — ACTUAL", kpi_revenue)
+        draw_kpi(ws, 6, 5, "EPS — ACTUAL", kpi_eps)
+        draw_kpi(ws, 10, 5, "GROSS MARGIN — ACTUAL", kpi_margin)
+
+        # Auditor pass rate -- a real formula against the Audit Trail sheet, not a hardcoded string
+        au_first = audit_info["hdr_row"] + 1
+        au_last = audit_info["hdr_row"] + audit_info["n_rows"]
+        au_col = audit_info["status_col"]
+        draw_kpi(ws, 14, 5, "AUDITOR PASS RATE", None)
+        ws["N6"] = (f"=COUNTIF('Audit Trail'!{au_col}{au_first}:{au_col}{au_last},\"Verified\")"
+                    f"/COUNTA('Audit Trail'!{au_col}{au_first}:{au_col}{au_last})")
+        ws["N6"].number_format = "0%"
+        ws["N6"].font = f_kpi_num()
+
+        # High-friction exchange count -- real formula against the Friction Log sheet
+        fr_first = friction_info["hdr_row"] + 1
+        fr_last = friction_info["hdr_row"] + friction_info["n_rows"]
+        fr_col = friction_info["level_col"]
+        draw_kpi(ws, 18, 5, "HIGH-FRICTION EXCHANGES", None)
+        ws["R6"] = f"=COUNTIF('Q&A Friction Log'!{fr_col}{fr_first}:{fr_col}{fr_last},\"High\")"
+        ws["R6"].font = f_kpi_num()
+
+        # Executive verdict callout
+        # Merged cells do NOT auto-fit in Excel (confirmed: openpyxl sets
+        # customHeight=1 on any explicit height, which disables auto-fit) --
+        # so this is sized deterministically from the actual verdict length.
+        ws["B9"] = "EXECUTIVE VERDICT"
+        ws["B9"].font = f_kicker()
+        merge_width_chars = 138  # sum of column widths B:P
+        total_h = estimate_wrapped_height(verdict, column_width_chars=merge_width_chars, font_pt=11, min_lines=2)
+        verdict_rows = 3
+        per_row_h = round(total_h / verdict_rows, 1)
+        ws.merge_cells(f"B10:P{9 + verdict_rows}")
+        vcell = ws["B10"]
+        vcell.value = verdict
+        vcell.font = Font(name=FONT_NAME, size=11, color=TEXT)
+        vcell.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
+        left_accent = Side(style="thick", color=GOLD)
+        for r in range(10, 10 + verdict_rows):
+            ws.cell(row=r, column=2).border = Border(left=left_accent)
+            ws.row_dimensions[r].height = per_row_h
+        # spacer row before the chart so it isn't flush against the callout
+        ws.row_dimensions[10 + verdict_rows].height = 8
+
+        # --- Recurring friction callout ---
+        # Built FIRST (before the chart data table) purely to compute how many
+        # rows it needs, so the chart data table below can be placed at a
+        # position guaranteed not to collide with it. The chart's visual anchor
+        # (B16) is independent of this -- a chart can reference data cells
+        # anywhere on the sheet -- so ordering here is about layout safety only.
+        # Measured directly from the saved file's drawing XML (not a re-guess):
+        # an 8cm-tall chart anchored at row 16 empirically ends around row 30.
+        # An earlier estimate of 34 rows was checked against this measurement
+        # and found to overshoot by ~20 rows of dead space -- corrected here.
+        chart_area_rows = 14
+        friction_section_row = 16 + chart_area_rows + 2
+        ws.cell(row=friction_section_row, column=2, value="RECURRING FRICTION — RAISED IN BOTH QUARTERS")
+        ws.cell(row=friction_section_row, column=2).font = f_kicker()
+        persistent_items = [r for r in delta_friction if r["status"] == "Persistent/Recurring"]
+        r = friction_section_row + 1
+        for item in persistent_items:
+            ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=16)
+            c = ws.cell(row=r, column=2, value=f"● {item['topic']}")
+            c.font = f_bold()
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+            r += 1
+            ws.merge_cells(start_row=r, start_column=2, end_row=r + 1, end_column=16)
+            c2 = ws.cell(row=r, column=2, value=item["detail"])
+            c2.font = f_body()
+            c2.alignment = Alignment(wrap_text=True, vertical="top")
+            # Merged cells don't auto-fit -- sized deterministically from actual length
+            detail_h = estimate_wrapped_height(item["detail"], column_width_chars=138, font_pt=10, min_lines=1)
+            ws.row_dimensions[r].height = round(detail_h / 2, 1)
+            ws.row_dimensions[r + 1].height = round(detail_h / 2, 1)
+            r += 3
+        friction_end_row = r
+
+        # --- Chart data table (visible, labeled -- not a hidden helper range) ---
+        # Placed safely below the friction section, whose exact length is now known.
+        chart_data_row = friction_end_row + 3
+        ws.cell(row=chart_data_row, column=2,
+                value="Chart data — midpoint of each guidance range, computed for charting. Full ranges: Forward Guidance & Deltas tab.")
+        ws.cell(row=chart_data_row, column=2).font = f_note()
+        hdr_row = chart_data_row + 1
+        ws.cell(row=hdr_row, column=2, value="Metric")
+        ws.cell(row=hdr_row, column=3, value=f"{prior_period} Guidance (mid, %)")
+        ws.cell(row=hdr_row, column=4, value=f"{latest_period} Guidance (mid, %)")
+        style_header_row(ws, hdr_row, 3, start_col=2)
+
+        chart_metrics = [r2["metric"] for r2 in delta_guidance
+                          if parse_midpoint_pct(r2["prior_value"]) is not None
+                          and parse_midpoint_pct(r2["current_value"]) is not None]
+        data_row = hdr_row + 1
+        plotted = 0
+        for metric_name in chart_metrics:
+            row_data = next((r2 for r2 in delta_guidance if r2["metric"] == metric_name), None)
+            if row_data:
+                prior_mid = parse_midpoint_pct(row_data["prior_value"])
+                curr_mid = parse_midpoint_pct(row_data["current_value"])
+                if prior_mid is not None and curr_mid is not None:
+                    ws.cell(row=data_row, column=2, value=metric_name)
+                    ws.cell(row=data_row, column=3, value=prior_mid)
+                    ws.cell(row=data_row, column=4, value=curr_mid)
+                    for c in (2, 3, 4):
+                        ws.cell(row=data_row, column=c).font = f_body()
+                        ws.cell(row=data_row, column=c).border = BORDER_ALL
+                    data_row += 1
+                    plotted += 1
+        chart_data_end_row = hdr_row + plotted
+
+        # --- The chart itself: anchored at B16, drawn over the KPI/verdict
+        # area's empty space below, referencing the data table wherever it sits ---
+        if plotted > 0:
+            chart = BarChart()
+            chart.type = "col"
+            chart.grouping = "clustered"
+            chart.overlap = -20
+            chart.title = "Forward Guidance Shift (Midpoint %)"
+            chart.style = 10
+            chart.y_axis.title = "Guidance midpoint (%)"
+            chart.y_axis.majorGridlines = None
+            data_ref = Reference(ws, min_col=3, max_col=4, min_row=hdr_row, max_row=chart_data_end_row)
+            cats_ref = Reference(ws, min_col=2, min_row=hdr_row + 1, max_row=chart_data_end_row)
+            chart.add_data(data_ref, titles_from_data=True)
+            chart.set_categories(cats_ref)
+            chart.width = 16
+            chart.height = 8
+            if len(chart.series) >= 1:
+                chart.series[0].graphicalProperties.solidFill = "9AA1AC"
+            if len(chart.series) >= 2:
+                chart.series[1].graphicalProperties.solidFill = GOLD
+            ws.add_chart(chart, "B16")
+
+        # --- Friction Level + Tone Shift distribution charts (quant summary) ---
+        dist_row = chart_data_end_row + 3
+        ws.cell(row=dist_row, column=2, value="Signal Distribution — This Quarter").font = f_kicker()
+        hdr2 = dist_row + 1
+        ws.cell(row=hdr2, column=2, value="Friction Level")
+        ws.cell(row=hdr2, column=3, value="Count")
+        style_header_row(ws, hdr2, 2, start_col=2)
+        friction_counts = {"High": 0, "Medium": 0, "Low": 0}
+        for r2 in latest_friction:
+            lvl = r2.get("friction_level")
+            if lvl in friction_counts:
+                friction_counts[lvl] += 1
+        for i, (lvl, cnt) in enumerate(friction_counts.items()):
+            ws.cell(row=hdr2 + 1 + i, column=2, value=lvl)
+            ws.cell(row=hdr2 + 1 + i, column=3, value=cnt)
+        friction_last = hdr2 + len(friction_counts)
+
+        hdr3 = dist_row + 1
+        ws.cell(row=hdr3, column=6, value="Tone Shift")
+        ws.cell(row=hdr3, column=7, value="Count")
+        style_header_row(ws, hdr3, 2, start_col=6)
+        tone_counts = {"More Cautious": 0, "More Confident": 0, "Similar/No Change": 0}
+        for r2 in delta_tone:
+            d = r2.get("shift_direction")
+            if d in tone_counts:
+                tone_counts[d] += 1
+        for i, (d, cnt) in enumerate(tone_counts.items()):
+            ws.cell(row=hdr3 + 1 + i, column=6, value=d)
+            ws.cell(row=hdr3 + 1 + i, column=7, value=cnt)
+        tone_last = hdr3 + len(tone_counts)
+
+        if sum(friction_counts.values()) > 0:
+            fchart = BarChart()
+            fchart.type = "col"
+            fchart.title = "Friction Level Distribution"
+            fchart.style = 10
+            fdata = Reference(ws, min_col=3, min_row=hdr2, max_row=friction_last)
+            fcats = Reference(ws, min_col=2, min_row=hdr2 + 1, max_row=friction_last)
+            fchart.add_data(fdata, titles_from_data=True)
+            fchart.set_categories(fcats)
+            fchart.width, fchart.height = 11, 8
+            if fchart.series:
+                fchart.series[0].graphicalProperties.solidFill = RUST
+            ws.add_chart(fchart, f"B{dist_row + 6}")
+
+        if sum(tone_counts.values()) > 0:
+            tchart = BarChart()
+            tchart.type = "col"
+            tchart.title = "Tone Shift Distribution"
+            tchart.style = 10
+            tdata = Reference(ws, min_col=7, min_row=hdr3, max_row=tone_last)
+            tcats = Reference(ws, min_col=6, min_row=hdr3 + 1, max_row=tone_last)
+            tchart.add_data(tdata, titles_from_data=True)
+            tchart.set_categories(tcats)
+            tchart.width, tchart.height = 11, 8
+            if tchart.series:
+                tchart.series[0].graphicalProperties.solidFill = GREEN
+            ws.add_chart(tchart, f"H{dist_row + 6}")
+
+        # Footer
+        footer_row = dist_row + 6 + 18
+        ws.cell(row=footer_row, column=2,
+                value="Sources: SEC EDGAR 10-Q (filed 2026-05-01) · Roic.ai earnings call transcript · Generated by the Earnings Sentinel pipeline (Gemini)")
+        ws.cell(row=footer_row, column=2).font = f_note()
+
+
+
+
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    _ = build_actuals_sheet(wb)
+    fwd_info = build_forward_guidance_sheet(wb)
+    build_tone_sheet(wb)
+    friction_info = build_friction_sheet(wb)
+    audit_info = build_audit_sheet(wb)
+    build_methodology_sheet(wb)
+    build_dashboard(wb, friction_info, audit_info, fwd_info)
+
+    wb.move_sheet("Dashboard", offset=-(len(wb.sheetnames) - 1))
+
+    for name in wb.sheetnames:
+        ws = wb[name]
+        ws.page_setup.orientation = "landscape"
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.print_area = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
+        ws.page_margins.left = ws.page_margins.right = 0.4
+        ws.page_margins.top = ws.page_margins.bottom = 0.5
+
+    out = f"EarningsSentinel_{ticker}_{latest_period_key}_Presentation.xlsx"
+    wb.save(out)
+    return out
+
+
+# ==============================================================================
+# PHASE 5 UPGRADE — HTML Dashboard ("communication layer")
+# Single self-contained HTML file: KPI strip, forward-guidance range-shift
+# bars, a "redline" view for language drift (literal editorial tracked-
+# changes styling -- struck-through prior phrasing, highlighted current
+# phrasing), Q&A friction cards, and an auditor trust badge.
+# ==============================================================================
+import re
+
+# NOTE: find_metric, classify_change, HIGHER_IS_BETTER/WORSE are already
+# defined above by the Excel module -- reused here as-is (removing the
+# duplicate definitions that used to live here fixes a real bug: both
+# copies existed under the same names, so this one silently overwrote the
+# Excel module's version with different casing, causing a KeyError in
+# CLASS_FILL/CLASS_FONT when the Excel sheet builders ran afterward).
+
+
+def parse_range_generic(text):
+    nums = re.findall(r"(\d+\.?\d*)", str(text).replace(",", ""))
+    nums = [float(n) for n in nums]
+    if len(nums) >= 2:
+        return (nums[0], nums[1])
+    if len(nums) == 1:
+        return (nums[0], nums[0])
+    return None
+
+
+
+
+def export_html_dashboard(ticker):
+    """
+    Builds a single-file, presentation-ready HTML dashboard for one ticker.
+    Returns the output filename.
+    """
+    all_quarters = load_all_saved_quarters(ticker)
+    if not all_quarters:
+        raise ValueError(f"No saved quarters found for {ticker}. Run run_pipeline('{ticker}') first.")
+
+    latest = all_quarters[-1]
+    latest_period = latest.get("quarter", "")
+    latest_period_key = latest_period.replace(" ", "")
+
+    audit = _load_latest_matching(f"{HISTORY_DIR}/audits", ticker, lambda f: f.endswith("_audit.json"))
+    delta = _load_latest_matching(f"{HISTORY_DIR}/deltas", ticker, lambda f: f"to_{latest_period_key}" in f)
+
+    prior_period = delta.get("prior_period", "N/A") if delta else "N/A"
+    pass_rate_str = f"{audit.get('pass_rate', 1.0)*100:.0f}%" if audit else "N/A"
+    verdict = delta.get("overall_verdict", "This is the first saved quarter for this ticker -- no prior-quarter comparison exists yet.") if delta else "This is the first saved quarter for this ticker -- no prior-quarter comparison exists yet."
+
+    latest_guidance = latest.get("quantitative_guidance", [])
+    actuals = [r for r in latest_guidance if r.get("period") and "actual" in r["period"].lower()]
+    announcements = [r for r in latest_guidance if r.get("period") and "announcement" in r["period"].lower()]
+
+    delta_guidance = delta.get("guidance_deltas", []) if delta else []
+    delta_tone = delta.get("tone_deltas", []) if delta else []
+    delta_friction = delta.get("friction_deltas", []) if delta else []
+    latest_friction = latest.get("qa_friction", [])
+    audit_verified = audit.get("verified", []) if audit else []
+    audit_flagged = audit.get("flagged", []) if audit else []
+
+    kpi_revenue = find_metric(actuals, ["revenue"], exclude=["iphone", "services", "mac", "ipad", "wearable"]) or "N/A"
+    kpi_eps = find_metric(actuals, ["eps", "earnings per share"]) or "N/A"
+    kpi_margin = find_metric(actuals, ["gross margin"], exclude=["product", "services"]) or "N/A"
+    high_friction_count = sum(1 for r in latest_friction if r["friction_level"] == "High")
+
+
+    for row in delta_guidance:
+        row["_class"] = classify_change(row["metric"], row["change_type"])
+        row["_prior_range"] = parse_range_generic(row["prior_value"]) if row["prior_value"] != "Not mentioned" else None
+        row["_current_range"] = parse_range_generic(row["current_value"]) if row["current_value"] != "Not mentioned" else None
+
+
+
+    RANGE_BAR_METRICS = ["Total Revenue Growth", "Gross Margin", "Operating Expenses"]
+
+    def render_range_bar(metric_row):
+        lo_p, hi_p = metric_row["_prior_range"]
+        lo_c, hi_c = metric_row["_current_range"]
+        axis_lo = min(lo_p, lo_c) - max(1, (max(hi_p, hi_c) - min(lo_p, lo_c)) * 0.25)
+        axis_hi = max(hi_p, hi_c) + max(1, (max(hi_p, hi_c) - min(lo_p, lo_c)) * 0.25)
+        span = axis_hi - axis_lo if axis_hi > axis_lo else 1
+
+        def pct(v):
+            return round((v - axis_lo) / span * 100, 1)
+
+        p_start, p_end = pct(lo_p), pct(hi_p)
+        c_start, c_end = pct(lo_c), pct(hi_c)
+        cls = metric_row["_class"].lower()
+        return f'''
+        <div class="rangebar">
+          <div class="rangebar-head">
+            <span class="rangebar-metric">{metric_row["metric"]}</span>
+            <span class="rangebar-change chip chip-{cls}">{metric_row["change_type"]}</span>
+          </div>
+          <div class="rangebar-track">
+            <div class="rangebar-seg rangebar-prior" style="left:{p_start}%;width:{max(p_end-p_start,1.5)}%"></div>
+            <div class="rangebar-seg rangebar-current" style="left:{c_start}%;width:{max(c_end-c_start,1.5)}%"></div>
+          </div>
+          <div class="rangebar-labels">
+            <span class="rangebar-label-prior">{prior_period}: {metric_row["prior_value"]}</span>
+            <span class="rangebar-label-current">{latest_period}: {metric_row["current_value"]}</span>
+          </div>
+        </div>'''
+
+    range_bars_html = "\n".join(
+        render_range_bar(r) for r in delta_guidance
+        if r["metric"] in RANGE_BAR_METRICS and r["_prior_range"] and r["_current_range"]
+    )
+
+    # ---------------------------------------------------------------------------
+    # Remaining guidance rows (New / Dropped / point-value metrics without a bar)
+    # ---------------------------------------------------------------------------
+    def render_guidance_row(r):
+        cls = r["_class"].lower()
+        return f'''
+        <div class="grow">
+          <div class="grow-top">
+            <span class="grow-metric">{r["metric"]}</span>
+            <span class="chip chip-{cls}">{r["change_type"]}</span>
+          </div>
+          <div class="grow-values"><span class="mono">{r["prior_value"]}</span> <span class="arrow">&rarr;</span> <span class="mono strong">{r["current_value"]}</span></div>
+          <div class="grow-sig">{r["significance"]}</div>
+        </div>'''
+
+    other_guidance_html = "\n".join(
+        render_guidance_row(r) for r in delta_guidance if r["metric"] not in RANGE_BAR_METRICS
+    )
+
+    # ---------------------------------------------------------------------------
+    # Tone & Language Drift -- the "redline" cards
+    # ---------------------------------------------------------------------------
+    SHIFT_CLASS = {"More Cautious": "unfavorable", "More Confident": "favorable", "Similar/No Change": "neutral"}
+
+    def render_tone_card(r):
+        cls = SHIFT_CLASS.get(r["shift_direction"], "neutral")
+        return f'''
+        <div class="redline-card">
+          <div class="redline-top">
+            <span class="redline-topic">{r["topic"]}</span>
+            <span class="chip chip-{cls}">{r["shift_direction"]}</span>
+          </div>
+          <p class="redline-text">
+            <del>{r["prior_language"]}</del>
+            <mark>{r["current_language"]}</mark>
+          </p>
+          <p class="redline-explain">{r["explanation"]}</p>
+        </div>'''
+
+    tone_html = "\n".join(render_tone_card(r) for r in delta_tone)
+
+    # ---------------------------------------------------------------------------
+    # Q&A Friction cards
+    # ---------------------------------------------------------------------------
+    FRICTION_CLASS = {"High": "unfavorable", "Medium": "neutral", "Low": "favorable"}
+
+    def render_friction_card(r):
+        cls = FRICTION_CLASS.get(r["friction_level"], "neutral")
+        return f'''
+        <div class="friction-card">
+          <div class="friction-top">
+            <span class="friction-firm">{r["analyst_firm"]}</span>
+            <span class="chip chip-{cls}">{r["friction_level"]} FRICTION</span>
+          </div>
+          <p class="friction-q"><span class="label">Q —</span> {r["question_summary"]}</p>
+          <p class="friction-a"><span class="label">A —</span> {r["answer_summary"]}</p>
+          <p class="friction-tactic">{r["evasion_tactic"]}</p>
+        </div>'''
+
+    friction_html = "\n".join(render_friction_card(r) for r in latest_friction)
+
+    STATUS_CLASS = {"Persistent/Recurring": "unfavorable", "New This Quarter": "neutral", "Resolved Since Last Quarter": "favorable"}
+
+    def render_pattern_row(r):
+        cls = STATUS_CLASS.get(r["status"], "neutral")
+        return f'''
+        <div class="pattern-row">
+          <span class="chip chip-{cls}">{r["status"]}</span>
+          <div class="pattern-body"><strong>{r["topic"]}</strong><p>{r["detail"]}</p></div>
+        </div>'''
+
+    pattern_html = "\n".join(render_pattern_row(r) for r in delta_friction)
+
+    # ---------------------------------------------------------------------------
+    # Audit
+    # ---------------------------------------------------------------------------
+    def render_audit_row(r, status):
+        detail = r.get("phrase") or r.get("analyst_firm") or ""
+        source = r.get("quote") or r.get("question") or ""
+        cls = "favorable" if status == "Verified" else "unfavorable"
+        return f'''
+        <div class="audit-row">
+          <span class="chip chip-{cls}">{status}</span>
+          <div class="audit-body"><strong>{detail}</strong><p class="mono">{source}</p></div>
+        </div>'''
+
+    audit_html = "\n".join(render_audit_row(r, "Verified") for r in audit_verified) + \
+                 "\n".join(render_audit_row(r, "Flagged") for r in audit_flagged)
+
+
+    # ---------------------------------------------------------------------------
+    # Final assembly
+    # ---------------------------------------------------------------------------
+    html_out = f"""<!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Earnings Sentinel — {ticker} {latest_period}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,600;1,6..72,500&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+    :root {{
+      --ink: #14181F;
+      --surface: #1B212B;
+      --surface-2: #222937;
+      --border: #2E3542;
+      --text: #EDEAE2;
+      --text-muted: #8B93A1;
+      --gold: #CBA135;
+      --gold-bg: rgba(203,161,53,0.14);
+      --green: #4FAE7F;
+      --green-bg: rgba(79,174,127,0.14);
+      --rust: #C1614A;
+      --rust-bg: rgba(193,97,74,0.14);
+      --grey-bg: rgba(139,147,161,0.12);
+      --serif: 'Newsreader', Georgia, serif;
+      --sans: 'IBM Plex Sans', -apple-system, sans-serif;
+      --mono: 'IBM Plex Mono', 'SF Mono', monospace;
+    }}
+    * {{ margin:0; padding:0; box-sizing:border-box; }}
+    html {{ scroll-behavior:smooth; }}
+    body {{
+      background:var(--ink); color:var(--text); font-family:var(--sans);
+      font-size:15px; line-height:1.6; -webkit-font-smoothing:antialiased;
+    }}
+    .mono {{ font-family:var(--mono); }}
+    .strong {{ font-weight:600; }}
+    ::selection {{ background:var(--gold-bg); }}
+
+    /* Nav */
+    nav {{
+      position:sticky; top:0; z-index:50; display:flex; align-items:center;
+      justify-content:space-between; padding:16px 40px; background:rgba(20,24,31,0.92);
+      backdrop-filter:blur(10px); border-bottom:1px solid var(--border);
+    }}
+    .nav-brand {{ font-family:var(--mono); font-size:12px; letter-spacing:0.12em; color:var(--gold); font-weight:600; }}
+    .nav-links {{ display:flex; gap:28px; }}
+    .nav-links a {{ color:var(--text-muted); text-decoration:none; font-size:13px; font-weight:500; transition:color .15s; }}
+    .nav-links a:hover {{ color:var(--text); }}
+
+    /* Layout */
+    .wrap {{ max-width:1080px; margin:0 auto; padding:0 40px; }}
+    section {{ padding:56px 0; border-bottom:1px solid var(--border); }}
+    section:last-of-type {{ border-bottom:none; }}
+    .kicker {{ font-family:var(--mono); font-size:12px; letter-spacing:0.14em; color:var(--gold); font-weight:600; text-transform:uppercase; margin-bottom:10px; }}
+    h1 {{ font-family:var(--serif); font-size:42px; font-weight:600; letter-spacing:-0.01em; margin-bottom:8px; }}
+    .subtitle {{ color:var(--text-muted); font-size:14px; margin-bottom:36px; }}
+    h2 {{ font-family:var(--serif); font-size:26px; font-weight:600; margin-bottom:6px; }}
+    .section-desc {{ color:var(--text-muted); font-size:13.5px; max-width:640px; margin-bottom:28px; }}
+
+    /* Hero verdict */
+    .verdict {{
+      border-left:3px solid var(--gold); background:var(--surface); padding:24px 28px;
+      border-radius:0 8px 8px 0; margin-bottom:8px;
+    }}
+    .verdict p {{ font-family:var(--serif); font-style:italic; font-size:19px; line-height:1.55; color:var(--text); }}
+
+    /* KPI strip */
+    .kpi-grid {{ display:grid; grid-template-columns:repeat(5,1fr); gap:1px; background:var(--border); border:1px solid var(--border); border-radius:10px; overflow:hidden; margin-top:32px; }}
+    .kpi {{ background:var(--surface); padding:20px 18px; }}
+    .kpi-label {{ font-size:11px; letter-spacing:0.06em; color:var(--text-muted); text-transform:uppercase; margin-bottom:8px; }}
+    .kpi-value {{ font-family:var(--mono); font-size:24px; font-weight:600; color:var(--text); }}
+
+    /* Chips */
+    .chip {{ display:inline-block; font-family:var(--mono); font-size:10.5px; font-weight:600; letter-spacing:0.03em; text-transform:uppercase; padding:4px 9px; border-radius:20px; white-space:nowrap; }}
+    .chip-favorable {{ background:var(--green-bg); color:var(--green); }}
+    .chip-unfavorable {{ background:var(--rust-bg); color:var(--rust); }}
+    .chip-neutral {{ background:var(--gold-bg); color:var(--gold); }}
+
+    /* Range bars */
+    .rangebar {{ background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:18px 20px; margin-bottom:14px; }}
+    .rangebar-head {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }}
+    .rangebar-metric {{ font-weight:600; font-size:14.5px; }}
+    .rangebar-track {{ position:relative; height:10px; background:var(--surface-2); border-radius:6px; margin-bottom:12px; }}
+    .rangebar-seg {{ position:absolute; top:0; height:10px; border-radius:6px; }}
+    .rangebar-prior {{ background:#4A5262; opacity:0.7; }}
+    .rangebar-current {{ background:var(--gold); }}
+    .rangebar-labels {{ display:flex; justify-content:space-between; font-size:12px; }}
+    .rangebar-label-prior {{ color:var(--text-muted); }}
+    .rangebar-label-current {{ color:var(--gold); font-weight:600; }}
+
+    /* Other guidance rows */
+    .grow {{ background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px 20px; margin-bottom:12px; }}
+    .grow-top {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }}
+    .grow-metric {{ font-weight:600; font-size:14px; }}
+    .grow-values {{ font-size:13.5px; color:var(--text-muted); margin-bottom:8px; }}
+    .grow-values .arrow {{ color:var(--gold); }}
+    .grow-sig {{ font-size:13px; color:var(--text-muted); }}
+
+    /* Redline cards */
+    .redline-card {{ background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:20px 22px; margin-bottom:14px; }}
+    .redline-top {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }}
+    .redline-topic {{ font-weight:600; font-size:14.5px; }}
+    .redline-text {{ font-family:var(--serif); font-size:16.5px; line-height:1.7; margin-bottom:12px; }}
+    .redline-text del {{ color:var(--text-muted); text-decoration:line-through; text-decoration-color:var(--rust); text-decoration-thickness:1.5px; margin-right:8px; }}
+    .redline-text mark {{ background:var(--gold-bg); color:var(--text); padding:1px 6px; border-radius:4px; font-weight:500; }}
+    .redline-explain {{ font-size:13px; color:var(--text-muted); }}
+
+    /* Friction cards */
+    .friction-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }}
+    .friction-card {{ background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:20px 22px; }}
+    .friction-top {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }}
+    .friction-firm {{ font-weight:600; font-size:14px; }}
+    .friction-q, .friction-a {{ font-size:13.5px; margin-bottom:8px; }}
+    .friction-q .label, .friction-a .label {{ color:var(--gold); font-family:var(--mono); font-weight:600; }}
+    .friction-a {{ color:var(--text-muted); }}
+    .friction-tactic {{ font-size:12px; color:var(--text-muted); font-style:italic; margin-top:10px; padding-top:10px; border-top:1px solid var(--border); }}
+
+    /* Pattern / audit rows */
+    .pattern-row, .audit-row {{ display:flex; gap:16px; align-items:flex-start; padding:14px 0; border-bottom:1px solid var(--border); }}
+    .pattern-row:last-child, .audit-row:last-child {{ border-bottom:none; }}
+    .pattern-body strong, .audit-body strong {{ display:block; font-size:14px; margin-bottom:4px; }}
+    .pattern-body p, .audit-body p {{ font-size:13px; color:var(--text-muted); }}
+    .audit-body p {{ font-size:12px; }}
+
+    /* Trust badge */
+    .trust-strip {{ display:flex; align-items:center; gap:20px; background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:20px 24px; margin-bottom:28px; }}
+    .trust-badge {{ font-family:var(--mono); font-size:32px; font-weight:600; color:var(--green); }}
+    .trust-text {{ font-size:13px; color:var(--text-muted); max-width:520px; }}
+
+    /* Footer */
+    footer {{ padding:32px 0 60px; }}
+    footer p {{ font-size:12px; color:var(--text-muted); line-height:1.8; }}
+    footer a {{ color:var(--gold); text-decoration:none; }}
+
+    @media (max-width: 720px) {{
+      .wrap {{ padding:0 20px; }}
+      nav {{ padding:14px 20px; }}
+      .nav-links {{ display:none; }}
+      h1 {{ font-size:30px; }}
+      .kpi-grid {{ grid-template-columns:repeat(2,1fr); }}
+      .friction-grid {{ grid-template-columns:1fr; }}
+    }}
+    </style>
+    </head>
+    <body>
+
+    <nav>
+      <span class="nav-brand">EARNINGS SENTINEL</span>
+      <div class="nav-links">
+        <a href="#guidance">Guidance</a>
+        <a href="#tone">Tone</a>
+        <a href="#friction">Friction</a>
+        <a href="#audit">Audit</a>
+        <a href="#sources">Sources</a>
+      </div>
+    </nav>
+
+    <div class="wrap">
+
+    <section id="overview">
+      <div class="kicker">AI Equity Research Brief</div>
+      <h1>{ticker} — {latest_period} Earnings Analysis</h1>
+      <div class="subtitle">Compared against {prior_period} &middot; Sourced from the earnings call transcript and SEC 10-Q filing</div>
+
+      <div class="verdict"><p>{verdict}</p></div>
+
+      <div class="kpi-grid">
+        <div class="kpi"><div class="kpi-label">Revenue — Actual</div><div class="kpi-value">{kpi_revenue}</div></div>
+        <div class="kpi"><div class="kpi-label">EPS — Actual</div><div class="kpi-value">{kpi_eps}</div></div>
+        <div class="kpi"><div class="kpi-label">Gross Margin — Actual</div><div class="kpi-value">{kpi_margin}</div></div>
+        <div class="kpi"><div class="kpi-label">Auditor Pass Rate</div><div class="kpi-value">{pass_rate_str}</div></div>
+        <div class="kpi"><div class="kpi-label">High-Friction Exchanges</div><div class="kpi-value">{high_friction_count}</div></div>
+      </div>
+    </section>
+
+    <section id="guidance">
+      <h2>Forward Guidance Shift</h2>
+      <div class="section-desc">How management's own forward-looking ranges moved between the {prior_period} call and the {latest_period} call. Coloring reflects investor impact, not raw direction — a raised expense estimate is unfavorable.</div>
+      {range_bars_html}
+      {other_guidance_html}
+    </section>
+
+    <section id="tone">
+      <h2>Tone &amp; Language Drift</h2>
+      <div class="section-desc">Redline view: struck-through text is prior language, superseded by the highlighted current phrasing.</div>
+      {tone_html}
+    </section>
+
+    <section id="friction">
+      <h2>Analyst Q&amp;A Friction</h2>
+      <div class="section-desc">Moments where an analyst pressed on a sensitive topic and management's answer was defensive, deflecting, or avoided a direct number.</div>
+      <div class="friction-grid">
+      {friction_html}
+      </div>
+    </section>
+
+    <section id="patterns">
+      <h2>Cross-Quarter Pattern</h2>
+      <div class="section-desc">Which friction points are new, resolved, or keep coming back call after call.</div>
+      {pattern_html}
+    </section>
+
+    <section id="audit">
+      <h2>Auditor Trail</h2>
+      <div class="trust-strip">
+        <div class="trust-badge">{pass_rate_str}</div>
+        <div class="trust-text">Every quoted claim and named analyst above is checked against the raw transcript text via deterministic fuzzy matching before publication — this catches fabricated quotes, not analytical disagreement.</div>
+      </div>
+      {audit_html}
+    </section>
+
+    <footer id="sources">
+      <p>
+        <strong>Sources:</strong> SEC EDGAR 10-Q (filed 2026-05-01, period ended 2026-03-28) —
+        <a href="https://www.sec.gov/Archives/edgar/data/320193/000032019326000013/aapl-20260328.htm" target="_blank" rel="noopener">view filing</a>
+        &middot; Earnings call transcript via Roic.ai &middot; Analysis generated by Google Gemini (gemini-flash-latest)<br>
+        This report is not investment advice. AI-extracted from public disclosures — verify materially important figures against the primary filing before acting on them.
+      </p>
+    </footer>
+
+    </div>
+    </body>
+    </html>
+    """
+
+    out_filename = f"EarningsSentinel_{ticker}_{latest_period.replace(' ','')}_Dashboard.html"
+    with open(out_filename, "w") as f:
+        f.write(html_out)
+    return out_filename
+
+
+
+# --- CELL 30: The Alert System ---
+def generate_alert(ticker):
+    """Builds a short alert message from the most recent QoQ delta on file. Returns None if no delta exists yet."""
+    delta = _load_latest_matching(f"{HISTORY_DIR}/deltas", ticker, lambda f: True)
+    if not delta:
+        return None
+    headline_changes = [
+        f"{d['metric']}: {d['change_type']}"
+        for d in delta.get("guidance_deltas", [])
+        if d.get("change_type") in ("Raised", "Lowered")
+    ]
+    lines = [
+        f"EARNINGS SENTINEL ALERT -- {ticker} ({delta.get('prior_period')} -> {delta.get('current_period')})",
+        "",
+        delta.get("overall_verdict", ""),
+    ]
+    if headline_changes:
+        lines.append("")
+        lines.append("Key guidance changes: " + "; ".join(headline_changes))
+    return "\n".join(lines)
+
+def send_slack_alert(webhook_url, message):
+    """
+    Posts a message to a Slack Incoming Webhook. Optional -- get a free
+    webhook URL at https://api.slack.com/messaging/webhooks, or leave
+    webhook_url blank to skip (the alert still prints to console either way).
+    """
+    if not webhook_url:
+        print("No Slack webhook configured -- skipping (this is optional).")
+        return False
+    resp = requests.post(webhook_url, json={"text": message}, timeout=10)
+    resp.raise_for_status()
+    print("Alert sent to Slack.")
+    return True
+
+# --- CELL 31: (superseded) ---
+# The old hardcoded "TICKER = AAPL" run that used to live here is replaced
+# by the interactive widget in Cell 32 below, which is now the single entry
+# point -- type a ticker, click the button, get the full report.
+
+# ==============================================================================
+# PHASE 6 — Interactive Front End (type any ticker, get a full report)
+# This is the "user-facing" layer: type a ticker, click the button, and the
+# full multi-agent pipeline (Ingest -> Analyze -> Audit -> Compare -> Present)
+# runs end-to-end for that company. The dashboard renders directly in this
+# cell's output (the primary "communication layer"); the Excel file
+# additionally triggers a browser download prompt.
+# ==============================================================================
+
+# --- CELL 32: The Interactive Site (embedded in this cell's output) ---
+# A custom-built site (not generic ipywidgets) that runs in this cell's
+# output and calls back into the SAME pipeline functions above via Colab's
+# JS<->Python bridge. No external hosting needed -- your API keys and Drive
+# access only exist in this session anyway, so execution stays here, but the
+# user-facing surface is a real, purpose-designed interface instead of a
+# text box and a button.
+from google.colab import output
+from IPython.display import display, HTML
+import base64
+
+def _generate_report_callback(ticker):
+    """Invoked from JS via google.colab.kernel.invokeFunction."""
+    from IPython.display import JSON
+
+    ticker = (ticker or "").strip().upper()
+    if not ticker:
+        return JSON({"success": False, "message": "Please enter a ticker."})
+
+    try:
+        bundle = run_pipeline(ticker)
+    except Exception as e:
+        return JSON({
+            "success": False,
+            "message": (f"Pipeline error for {ticker}: {e}. Note: Roic.ai's free tier "
+                        f"may only cover AAPL transcripts -- SEC filing data works for any ticker regardless.")
+        })
+    if not bundle:
+        return JSON({"success": False, "message": f"Pipeline did not complete for {ticker}. Check the Colab logs below this cell."})
+
+    try:
+        excel_file = export_polished_excel(ticker)
+        dashboard_file = export_html_dashboard(ticker)
+    except Exception as e:
+        return JSON({"success": False, "message": f"Report-building error: {e}"})
+
+    with open(dashboard_file, "r") as f:
+        dashboard_html = f.read()
+    with open(excel_file, "rb") as f:
+        excel_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    return JSON({
+        "success": True,
+        "dashboard_html": dashboard_html,
+        "excel_b64": excel_b64,
+        "excel_filename": excel_file,
+        "alert": generate_alert(ticker) or "",
+    })
+
+output.register_callback('generateReport', _generate_report_callback)
+
+SITE_HTML = r"""
+<div id="es-root">
+<style>
+#es-root {
+  --ink:#14181F; --surface:#1B212B; --surface-2:#222937; --border:#2E3542;
+  --text:#EDEAE2; --text-muted:#8B93A1; --gold:#CBA135; --gold-bg:rgba(203,161,53,.14);
+  --green:#4FAE7F; --rust:#C1614A;
+  font-family:'IBM Plex Sans',-apple-system,sans-serif;
+  background:var(--ink); color:var(--text); border-radius:14px; padding:0;
+  max-width:1080px; margin:0 auto; border:1px solid var(--border); overflow:hidden;
+}
+#es-root * { box-sizing:border-box; }
+#es-root .es-serif { font-family:'Newsreader',Georgia,serif; }
+#es-root .es-mono { font-family:'IBM Plex Mono','SF Mono',monospace; }
+#es-root .es-hero { padding:44px 48px 36px; border-bottom:1px solid var(--border); }
+#es-root .es-kicker { font-family:'IBM Plex Mono',monospace; font-size:11.5px; letter-spacing:.14em;
+  color:var(--gold); font-weight:600; text-transform:uppercase; margin-bottom:10px; }
+#es-root h1.es-title { font-size:34px; font-weight:600; margin:0 0 10px; letter-spacing:-.01em; }
+#es-root .es-sub { color:var(--text-muted); font-size:14px; max-width:560px; line-height:1.6; margin-bottom:28px; }
+#es-root .es-steps { display:flex; gap:0; margin-top:8px; }
+#es-root .es-step { flex:1; padding-right:18px; }
+#es-root .es-step-n { font-family:'IBM Plex Mono',monospace; color:var(--gold); font-size:12px; font-weight:600; }
+#es-root .es-step-t { font-size:13px; font-weight:600; margin:4px 0 2px; }
+#es-root .es-step-d { font-size:12px; color:var(--text-muted); line-height:1.5; }
+
+#es-root .es-console { padding:36px 48px 44px; }
+#es-root .es-inputrow { display:flex; gap:12px; }
+#es-root input#es-ticker {
+  flex:1; background:var(--surface); border:1px solid var(--border); color:var(--text);
+  font-family:'IBM Plex Mono',monospace; font-size:16px; letter-spacing:.03em; padding:14px 16px;
+  border-radius:8px; outline:none; text-transform:uppercase;
+}
+#es-root input#es-ticker:focus { border-color:var(--gold); }
+#es-root button#es-go {
+  background:var(--gold); color:#1B1500; border:none; border-radius:8px; padding:0 28px;
+  font-family:'IBM Plex Sans',sans-serif; font-weight:600; font-size:14px; cursor:pointer;
+  transition:filter .15s;
+}
+#es-root button#es-go:hover { filter:brightness(1.08); }
+#es-root button#es-go:disabled { background:var(--surface-2); color:var(--text-muted); cursor:not-allowed; }
+#es-root .es-hint { font-size:12px; color:var(--text-muted); margin-top:10px; }
+
+#es-root .es-status { margin-top:22px; display:none; }
+#es-root .es-status.active { display:block; }
+#es-root .es-statusline { display:flex; align-items:center; gap:10px; font-size:13px; color:var(--text-muted); padding:4px 0; }
+#es-root .es-dot { width:7px; height:7px; border-radius:50%; background:var(--gold); flex-shrink:0; animation:es-pulse 1.1s ease-in-out infinite; }
+@keyframes es-pulse { 0%,100%{opacity:.35} 50%{opacity:1} }
+
+#es-root .es-error { display:none; margin-top:20px; background:rgba(193,97,74,.12); border:1px solid var(--rust);
+  border-radius:8px; padding:16px 18px; font-size:13px; color:#E8BBAF; }
+#es-root .es-error.active { display:block; }
+
+#es-root .es-result { display:none; margin-top:28px; }
+#es-root .es-result.active { display:block; }
+#es-root .es-resultbar { display:flex; align-items:center; justify-content:space-between;
+  background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:14px 18px; margin-bottom:18px; }
+#es-root .es-resultbar-left { display:flex; align-items:center; gap:10px; font-size:13.5px; }
+#es-root .es-badge { color:var(--green); font-family:'IBM Plex Mono',monospace; font-weight:600; font-size:12px; }
+#es-root .es-dl-btn { background:transparent; border:1px solid var(--gold); color:var(--gold); border-radius:6px;
+  padding:8px 16px; font-size:12.5px; font-weight:600; cursor:pointer; font-family:'IBM Plex Sans',sans-serif; }
+#es-root .es-dl-btn:hover { background:var(--gold-bg); }
+#es-root iframe#es-frame { width:100%; height:1400px; border:1px solid var(--border); border-radius:10px; }
+
+@media (max-width:720px) {
+  #es-root .es-hero, #es-root .es-console { padding:28px 22px; }
+  #es-root .es-steps { flex-direction:column; gap:14px; }
+  #es-root h1.es-title { font-size:26px; }
+}
+</style>
+
+<div class="es-hero">
+  <div class="es-kicker">AI Equity Research Pipeline</div>
+  <h1 class="es-title es-serif">Earnings Sentinel</h1>
+  <div class="es-sub">Type a ticker. A four-agent pipeline ingests the latest earnings call and SEC filing, extracts guidance / tone / friction signals, audits every quote against the source, and compares it to the prior quarter — live.</div>
+  <div class="es-steps">
+    <div class="es-step"><div class="es-step-n">01</div><div class="es-step-t">Scraper</div><div class="es-step-d">Pulls the transcript + 10-Q filing</div></div>
+    <div class="es-step"><div class="es-step-n">02</div><div class="es-step-t">Analyst</div><div class="es-step-d">Extracts guidance, tone drift, friction</div></div>
+    <div class="es-step"><div class="es-step-n">03</div><div class="es-step-t">Auditor</div><div class="es-step-d">Verifies every quote against source text</div></div>
+    <div class="es-step"><div class="es-step-n">04</div><div class="es-step-t">Historian</div><div class="es-step-d">Compares against the prior quarter</div></div>
+  </div>
+</div>
+
+<div class="es-console">
+  <div class="es-inputrow">
+    <input id="es-ticker" type="text" value="AAPL" maxlength="8" placeholder="TICKER" />
+    <button id="es-go" onclick="esGenerate()">Generate Report</button>
+  </div>
+  <div class="es-hint">SEC filing data works for any US-listed ticker. Transcript coverage depends on your Roic.ai plan tier.</div>
+
+  <div class="es-status" id="es-status">
+    <div class="es-statusline"><span class="es-dot"></span><span id="es-status-text">Running...</span></div>
+  </div>
+
+  <div class="es-error" id="es-error"></div>
+
+  <div class="es-result" id="es-result">
+    <div class="es-resultbar">
+      <div class="es-resultbar-left"><span class="es-badge">● REPORT READY</span><span id="es-verdict-line" class="es-mono" style="color:var(--text-muted);font-size:12px;"></span></div>
+      <button class="es-dl-btn" onclick="esDownloadExcel()">Download Excel Report</button>
+    </div>
+    <iframe id="es-frame"></iframe>
+  </div>
+</div>
+</div>
+
+<script>
+let esLastExcel = null;
+
+function esSetStatus(msg) {
+  document.getElementById('es-status').classList.add('active');
+  document.getElementById('es-status-text').textContent = msg;
+}
+
+async function esGenerate() {
+  const btn = document.getElementById('es-go');
+  const tickerRaw = document.getElementById('es-ticker').value;
+  const ticker = (tickerRaw || '').trim().toUpperCase();
+
+  document.getElementById('es-error').classList.remove('active');
+  document.getElementById('es-result').classList.remove('active');
+
+  if (!ticker) { esShowError('Please enter a ticker.'); return; }
+
+  btn.disabled = true;
+  esSetStatus('Fetching transcript + SEC filing...');
+  const t1 = setTimeout(() => esSetStatus('Running Gemini analysis + audit...'), 3500);
+  const t2 = setTimeout(() => esSetStatus('Comparing against prior quarter, building report...'), 9000);
+
+  try {
+    const res = await google.colab.kernel.invokeFunction('generateReport', [ticker], {});
+    const data = res.data['application/json'];
+    clearTimeout(t1); clearTimeout(t2);
+    document.getElementById('es-status').classList.remove('active');
+
+    if (!data.success) { esShowError(data.message); btn.disabled = false; return; }
+
+    esLastExcel = { b64: data.excel_b64, filename: data.excel_filename };
+    const encodedDash = btoa(unescape(encodeURIComponent(data.dashboard_html)));
+    document.getElementById('es-frame').src = 'data:text/html;base64,' + encodedDash;
+    document.getElementById('es-verdict-line').textContent = ticker + ' · ' + new Date().toLocaleString();
+    document.getElementById('es-result').classList.add('active');
+  } catch (err) {
+    clearTimeout(t1); clearTimeout(t2);
+    document.getElementById('es-status').classList.remove('active');
+    const msg = String(err);
+    if (msg.includes('re-executed') || msg.includes('runtime access')) {
+      esShowError('This cell needs to be re-run once after any Colab reconnect (a runtime disconnect invalidates the JS/Python link). Click the ▶ button on this cell above, then try again -- no need to re-run the whole notebook.');
+    } else {
+      esShowError('Unexpected error: ' + err);
+    }
+  }
+  btn.disabled = false;
+}
+
+function esShowError(msg) {
+  const el = document.getElementById('es-error');
+  el.textContent = msg;
+  el.classList.add('active');
+}
+
+function esDownloadExcel() {
+  if (!esLastExcel) return;
+  const link = document.createElement('a');
+  link.href = 'data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,' + esLastExcel.b64;
+  link.download = esLastExcel.filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
+document.getElementById('es-ticker').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') esGenerate();
+});
+</script>
+"""
+
+display(HTML(SITE_HTML))
